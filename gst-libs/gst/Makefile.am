@@ -6,19 +6,26 @@ if USE_OPENCV
 OPENCV_DIR=opencv
 endif
 
+if USE_SOUP
+BASEDRM_DIR=basedrm
+else
+BASEDRM_DIR=
+endif
+
 SUBDIRS = uridownloader adaptivedemux interfaces basecamerabinsrc codecparsers \
-	 insertbin mpegts video audio player isoff webrtc $(WAYLAND_DIR) \
-	 $(OPENCV_DIR)
+	 insertbin mpegts video audio player isoff webrtc multiapp $(WAYLAND_DIR) \
+	 $(OPENCV_DIR) $(BASEDRM_DIR)
 
 noinst_HEADERS = gst-i18n-plugin.h gettext.h glib-compat-private.h
 DIST_SUBDIRS = uridownloader adaptivedemux interfaces basecamerabinsrc \
-	codecparsers insertbin mpegts wayland opencv video audio player isoff webrtc
+	codecparsers insertbin mpegts wayland opencv video audio player isoff webrtc \
+	multiapp $(BASEDRM_DIR)
 
 adaptivedemux: uridownloader
 
 INDEPENDENT_SUBDIRS = \
 	interfaces basecamerabinsrc codecparsers insertbin uridownloader \
-	mpegts player isoff $(WAYLAND_DIR) $(OPENCV_DIR)
+	mpegts player isoff multiapp $(WAYLAND_DIR) $(OPENCV_DIR)
 
 .PHONY: independent-subdirs $(INDEPENDENT_SUBDIRS)
 

@@ -1,0 +1,11 @@
+prefix=
+exec_prefix=
+libdir=@abs_top_builddir@/gst-libs/gst/multiapp/.libs
+includedir=@abs_top_builddir@/gst-libs
+
+Name: GStreamer Multiple AppSrc Library
+Description: Multiple AppSrc element handler, uninstalled
+Version: @VERSION@
+Requires: gstreamer-@GST_API_VERSION@ gstreamer-base-@GST_API_VERSION@
+Libs: -L${libdir} -lgstmultiapp-@GST_API_VERSION@
+Cflags: -I@abs_top_srcdir@/gst-libs -I@abs_top_builddir@/gst-libs

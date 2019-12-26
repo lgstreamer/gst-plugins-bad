@@ -37,6 +37,8 @@
 #else
 #include <gcrypt.h>
 #endif
+#include <gst/isoff/gstisoff.h>
+#include <gmodule.h>
 
 G_BEGIN_DECLS
 
@@ -65,7 +67,9 @@ typedef struct _GstHLSTSReader GstHLSTSReader;
 typedef enum {
   GST_HLS_TSREADER_NONE,
   GST_HLS_TSREADER_MPEGTS,
-  GST_HLS_TSREADER_ID3
+  GST_HLS_TSREADER_ID3,
+  GST_HLS_TSREADER_FMP4,        /* FIXME: TSREADER doesn't make sense for fMP4 */
+  GST_HLS_TSREADER_WEBVTT
 } GstHLSTSReaderType;
 
 struct _GstHLSTSReader
@@ -88,7 +92,7 @@ struct _GstHLSDemuxStream
   GstHLSTSReaderType stream_type;
 
   GstM3U8 *playlist;
-  gboolean is_primary_playlist;
+  GstHLSMedia *media;
 
   gboolean do_typefind;         /* Whether we need to typefind the next buffer */
   GstBuffer *pending_typefind_buffer; /* for collecting data until typefind succeeds */
@@ -98,6 +102,8 @@ struct _GstHLSDemuxStream
                                           We only know that it is the last at EOS */
   guint64 current_offset;              /* offset we're currently at */
   gboolean reset_pts;
+
+  GstClockTime presentation_offset;
 
   /* decryption tooling */
 #if defined(HAVE_OPENSSL)
@@ -114,6 +120,8 @@ struct _GstHLSDemuxStream
 
   gchar     *current_key;
   guint8    *current_iv;
+  gchar     *current_protection_meta;
+  gchar     *protection_meta_cache;
 
   /* Accumulator for reading PAT/PMT/PCR from
    * the stream so we can set timestamps/segments
@@ -121,6 +129,23 @@ struct _GstHLSDemuxStream
   GstBuffer *pending_pcr_buffer;
 
   GstHLSTSReader tsreader;
+
+  /* For fMP4 */
+  GstAdapter *isobmff_adapter;
+  GstBuffer *pending_pts_buffer;
+  struct {
+    guint32 current_fourcc;
+    guint64 current_start_offset;
+    guint64 current_offset;
+    guint64 current_size;
+  } isobmff_parser;
+
+  GstMoovBox *moov;
+  GstMoofBox *moof;
+  gboolean find_presentation_offset;
+
+  GstClockTime start_offset_after_seek;
+  gboolean rendition_switched;
 };
 
 typedef struct {
@@ -147,6 +172,13 @@ struct _GstHLSDemux
   GstHLSMasterPlaylist *master;
 
   GstHLSVariantStream  *current_variant;
+
+  gchar *drm_mediauri;
+  gchar *drm_clientid;
+  gchar *drm_type;
+  gchar *drm_systemid;
+  GModule *module_drmcontroller;
+  void *drm_ctrl_handle;
 };
 
 struct _GstHLSDemuxClass

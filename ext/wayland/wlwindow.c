@@ -86,22 +86,16 @@ gst_wl_window_finalize (GObject * gobject)
 {
   GstWlWindow *self = GST_WL_WINDOW (gobject);
 
-  if (self->shell_surface)
+  if (self->shell_surface) {
     wl_shell_surface_destroy (self->shell_surface);
+    wl_surface_destroy (self->surface);
+  }
 
-  if (self->video_viewport)
-    wp_viewport_destroy (self->video_viewport);
+  if (self->viewport)
+    wp_viewport_destroy (self->viewport);
 
-  wl_subsurface_destroy (self->video_subsurface);
-  wl_surface_destroy (self->video_surface);
-
-  if (self->area_subsurface)
-    wl_subsurface_destroy (self->area_subsurface);
-
-  if (self->area_viewport)
-    wp_viewport_destroy (self->area_viewport);
-
-  wl_surface_destroy (self->area_surface);
+  if (self->surface_wrapper)
+    wl_proxy_wrapper_destroy (self->surface_wrapper);
 
   g_clear_object (&self->display);
 
@@ -109,7 +103,8 @@ gst_wl_window_finalize (GObject * gobject)
 }
 
 static GstWlWindow *
-gst_wl_window_new_internal (GstWlDisplay * display, GMutex * render_lock)
+gst_wl_window_new_internal (GstWlDisplay * display, struct wl_surface *surface,
+    GMutex * render_lock)
 {
   GstWlWindow *window;
   struct wl_region *region;
@@ -118,33 +113,20 @@ gst_wl_window_new_internal (GstWlDisplay * display, GMutex * render_lock)
   window->display = g_object_ref (display);
   window->render_lock = render_lock;
 
-  window->area_surface = wl_compositor_create_surface (display->compositor);
-  window->video_surface = wl_compositor_create_surface (display->compositor);
+  window->surface = surface;
+  window->surface_wrapper = wl_proxy_create_wrapper (surface);
 
-  wl_proxy_set_queue ((struct wl_proxy *) window->area_surface, display->queue);
-  wl_proxy_set_queue ((struct wl_proxy *) window->video_surface,
+  wl_proxy_set_queue ((struct wl_proxy *) window->surface_wrapper,
       display->queue);
 
-  /* embed video_surface in area_surface */
-  window->video_subsurface =
-      wl_subcompositor_get_subsurface (display->subcompositor,
-      window->video_surface, window->area_surface);
-  wl_subsurface_set_desync (window->video_subsurface);
-
   if (display->viewporter) {
-    window->area_viewport = wp_viewporter_get_viewport (display->viewporter,
-        window->area_surface);
-    window->video_viewport = wp_viewporter_get_viewport (display->viewporter,
-        window->video_surface);
+    window->viewport = wp_viewporter_get_viewport (display->viewporter,
+        window->surface);
   }
 
   /* do not accept input */
   region = wl_compositor_create_region (display->compositor);
-  wl_surface_set_input_region (window->area_surface, region);
-  wl_region_destroy (region);
-
-  region = wl_compositor_create_region (display->compositor);
-  wl_surface_set_input_region (window->video_surface, region);
+  wl_surface_set_input_region (window->surface, region);
   wl_region_destroy (region);
 
   return window;
@@ -156,12 +138,14 @@ gst_wl_window_new_toplevel (GstWlDisplay * display, const GstVideoInfo * info,
 {
   GstWlWindow *window;
   gint width;
+  struct wl_surface *surface;
 
-  window = gst_wl_window_new_internal (display, render_lock);
+  surface = wl_compositor_create_surface (display->compositor);
+  window = gst_wl_window_new_internal (display, surface, render_lock);
 
   /* go toplevel */
   window->shell_surface = wl_shell_get_shell_surface (display->shell,
-      window->area_surface);
+      window->surface);
 
   if (window->shell_surface) {
     wl_shell_surface_add_listener (window->shell_surface,
@@ -187,14 +171,8 @@ gst_wl_window_new_in_surface (GstWlDisplay * display,
     struct wl_surface * parent, GMutex * render_lock)
 {
   GstWlWindow *window;
-  window = gst_wl_window_new_internal (display, render_lock);
-
-  /* embed in parent */
-  window->area_subsurface =
-      wl_subcompositor_get_subsurface (display->subcompositor,
-      window->area_surface, parent);
-  wl_subsurface_set_desync (window->area_subsurface);
-
+  /* Since webos does not support subsurface, use the parent surface as it is. */
+  window = gst_wl_window_new_internal (display, parent, render_lock);
   return window;
 }
 
@@ -211,7 +189,7 @@ gst_wl_window_get_wl_surface (GstWlWindow * window)
 {
   g_return_val_if_fail (window != NULL, NULL);
 
-  return window->video_surface;
+  return window->surface_wrapper;
 }
 
 gboolean
@@ -229,24 +207,22 @@ gst_wl_window_resize_video_surface (GstWlWindow * window, gboolean commit)
   GstVideoRectangle dst = { 0, };
   GstVideoRectangle res;
 
-  /* center the video_subsurface inside area_subsurface */
+  /* center the subsurface */
   src.w = window->video_width;
   src.h = window->video_height;
   dst.w = window->render_rectangle.w;
   dst.h = window->render_rectangle.h;
 
-  if (window->video_viewport) {
+  if (window->viewport) {
     gst_video_sink_center_rect (src, dst, &res, TRUE);
-    wp_viewport_set_destination (window->video_viewport, res.w, res.h);
+    wp_viewport_set_destination (window->viewport, res.w, res.h);
   } else {
     gst_video_sink_center_rect (src, dst, &res, FALSE);
   }
 
-  wl_subsurface_set_position (window->video_subsurface, res.x, res.y);
-
   if (commit) {
-    wl_surface_damage (window->video_surface, 0, 0, res.w, res.h);
-    wl_surface_commit (window->video_surface);
+    wl_surface_damage (window->surface_wrapper, res.x, res.y, res.w, res.h);
+    wl_surface_commit (window->surface_wrapper);
   }
 
   if (gst_wl_window_is_toplevel (window)) {
@@ -255,7 +231,7 @@ gst_wl_window_resize_video_surface (GstWlWindow * window, gboolean commit)
     region = wl_compositor_create_region (window->display->compositor);
     wl_region_add (region, 0, 0, window->render_rectangle.w,
         window->render_rectangle.h);
-    wl_surface_set_input_region (window->area_surface, region);
+    wl_surface_set_input_region (window->surface, region);
     wl_region_destroy (region);
   }
 
@@ -268,19 +244,12 @@ gst_wl_window_set_opaque (GstWlWindow * window, const GstVideoInfo * info)
 {
   struct wl_region *region;
 
-  /* Set area opaque */
-  region = wl_compositor_create_region (window->display->compositor);
-  wl_region_add (region, 0, 0, window->render_rectangle.w,
-      window->render_rectangle.h);
-  wl_surface_set_opaque_region (window->area_surface, region);
-  wl_region_destroy (region);
-
   if (!GST_VIDEO_INFO_HAS_ALPHA (info)) {
-    /* Set video opaque */
+    /* Set opaque */
     region = wl_compositor_create_region (window->display->compositor);
     wl_region_add (region, 0, 0, window->render_rectangle.w,
         window->render_rectangle.h);
-    wl_surface_set_opaque_region (window->video_surface, region);
+    wl_surface_set_opaque_region (window->surface, region);
     wl_region_destroy (region);
   }
 }
@@ -294,28 +263,18 @@ gst_wl_window_render (GstWlWindow * window, GstWlBuffer * buffer,
         gst_util_uint64_scale_int_round (info->width, info->par_n, info->par_d);
     window->video_height = info->height;
 
-    wl_subsurface_set_sync (window->video_subsurface);
     gst_wl_window_resize_video_surface (window, FALSE);
     gst_wl_window_set_opaque (window, info);
   }
 
   if (G_LIKELY (buffer))
-    gst_wl_buffer_attach (buffer, window->video_surface);
+    gst_wl_buffer_attach (buffer, window->surface_wrapper);
   else
-    wl_surface_attach (window->video_surface, NULL, 0, 0);
+    wl_surface_attach (window->surface_wrapper, NULL, 0, 0);
 
-  wl_surface_damage (window->video_surface, 0, 0, window->video_rectangle.w,
+  wl_surface_damage (window->surface_wrapper, 0, 0, window->video_rectangle.w,
       window->video_rectangle.h);
-  wl_surface_commit (window->video_surface);
-
-  if (G_UNLIKELY (info)) {
-    /* commit also the parent (area_surface) in order to change
-     * the position of the video_subsurface */
-    wl_surface_damage (window->area_surface, 0, 0, window->render_rectangle.w,
-        window->render_rectangle.h);
-    wl_surface_commit (window->area_surface);
-    wl_subsurface_set_desync (window->video_subsurface);
-  }
+  wl_surface_commit (window->surface_wrapper);
 
   wl_display_flush (window->display->display);
 }
@@ -363,7 +322,7 @@ gst_wl_window_update_borders (GstWlWindow * window)
       gst_wl_shm_memory_construct_wl_buffer (gst_buffer_peek_memory (buf, 0),
       window->display, &info);
   gwlbuf = gst_buffer_add_wl_buffer (buf, wlbuf, window->display);
-  gst_wl_buffer_attach (gwlbuf, window->area_surface);
+  gst_wl_buffer_attach (gwlbuf, window->surface_wrapper);
 
   /* at this point, the GstWlBuffer keeps the buffer
    * alive and will free it on wl_buffer::release */
@@ -382,24 +341,16 @@ gst_wl_window_set_render_rectangle (GstWlWindow * window, gint x, gint y,
   window->render_rectangle.w = w;
   window->render_rectangle.h = h;
 
-  /* position the area inside the parent - needs a parent commit to apply */
-  if (window->area_subsurface)
-    wl_subsurface_set_position (window->area_subsurface, x, y);
-
   /* change the size of the area */
-  if (window->area_viewport)
-    wp_viewport_set_destination (window->area_viewport, w, h);
+  if (window->viewport)
+    wp_viewport_set_destination (window->viewport, w, h);
 
   gst_wl_window_update_borders (window);
 
   if (window->video_width != 0) {
-    wl_subsurface_set_sync (window->video_subsurface);
     gst_wl_window_resize_video_surface (window, TRUE);
   }
 
-  wl_surface_damage (window->area_surface, 0, 0, w, h);
-  wl_surface_commit (window->area_surface);
-
-  if (window->video_width != 0)
-    wl_subsurface_set_desync (window->video_subsurface);
+  wl_surface_damage (window->surface_wrapper, 0, 0, w, h);
+  wl_surface_commit (window->surface_wrapper);
 }

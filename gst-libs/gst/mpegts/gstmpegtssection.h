@@ -26,6 +26,7 @@
 
 #include <gst/gst.h>
 #include <gst/mpegts/gstmpegtsdescriptor.h>
+#include <../gst/mpegtsdemux/gstmpegdefs.h>
 
 G_BEGIN_DECLS
 
@@ -335,6 +336,7 @@ typedef enum {
   GST_MPEGTS_STREAM_TYPE_VIDEO_MPEG2_STEREO_ADDITIONAL_VIEW = 0x22,
   GST_MPEGTS_STREAM_TYPE_VIDEO_H264_STEREO_ADDITIONAL_VIEW  = 0x23,
   GST_MPEGTS_STREAM_TYPE_VIDEO_HEVC                   = 0x24,
+  GST_MPEGTS_STREAM_TYPE_VIDEO_HEVC_H265              = 0x27,
   /* 0x24 - 0x7e : Rec. ITU-T H.222.0 | ISO/IEC 13818-1 Reserved */
   GST_MPEGTS_STREAM_TYPE_IPMP_STREAM                  = 0x7f
   /* 0x80 - 0xff : User Private (or defined in other specs) */
@@ -372,6 +374,7 @@ struct _GstMpegtsPMT
 {
   guint16    pcr_pid;
   guint16    program_number;
+  gint       audio_number;   //It's for MHEG
 
   GPtrArray *descriptors;
   GPtrArray *streams;

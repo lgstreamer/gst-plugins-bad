@@ -116,6 +116,7 @@ enum
   PROP_VIDEO_MULTIVIEW_MODE,
   PROP_VIDEO_MULTIVIEW_FLAGS,
   PROP_AUDIO_VIDEO_OFFSET,
+  PROP_USE_DEFAULT_CONTEXT,
   PROP_LAST
 };
 
@@ -134,6 +135,8 @@ enum
   SIGNAL_VOLUME_CHANGED,
   SIGNAL_MUTE_CHANGED,
   SIGNAL_SEEK_DONE,
+  SIGNAL_ELEMENT_MESSAGE,
+  SIGNAL_APPLICATION_MESSAGE,
   SIGNAL_LAST
 };
 
@@ -164,6 +167,7 @@ struct _GstPlayer
 
   GstElement *playbin;
   GstBus *bus;
+  GSource *bus_source;
   GstState target_state, current_state;
   gboolean is_live, is_eos;
   GSource *tick_source, *ready_timeout_source;
@@ -198,6 +202,8 @@ struct _GstPlayer
   gchar *audio_sid;
   gchar *subtitle_sid;
   gulong stream_notify_id;
+
+  gboolean use_default_context;
 };
 
 struct _GstPlayerClass
@@ -218,6 +224,8 @@ static void gst_player_set_property (GObject * object, guint prop_id,
 static void gst_player_get_property (GObject * object, guint prop_id,
     GValue * value, GParamSpec * pspec);
 static void gst_player_constructed (GObject * object);
+static void gst_player_constructed_internal (GstPlayer * self);
+static void gst_player_dispose_internal (GstPlayer * self);
 
 static gpointer gst_player_main (gpointer data);
 
@@ -280,9 +288,6 @@ gst_player_init (GstPlayer * self)
 
   g_mutex_init (&self->lock);
   g_cond_init (&self->cond);
-
-  self->context = g_main_context_new ();
-  self->loop = g_main_loop_new (self->context, FALSE);
 
   /* *INDENT-OFF* */
   self->config = gst_structure_new_id (QUARK_CONFIG,
@@ -412,6 +417,11 @@ gst_player_class_init (GstPlayerClass * klass)
       "The synchronisation offset between audio and video in nanoseconds",
       G_MININT64, G_MAXINT64, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
 
+  param_specs[PROP_USE_DEFAULT_CONTEXT] =
+      g_param_spec_boolean ("use-default-context", "Use Default Context",
+      "If TRUE, GstPlayer will not make its own main loop", FALSE,
+      G_PARAM_CONSTRUCT_ONLY | G_PARAM_WRITABLE | G_PARAM_STATIC_STRINGS);
+
   g_object_class_install_properties (gobject_class, PROP_LAST, param_specs);
 
   signals[SIGNAL_URI_LOADED] =
@@ -479,6 +489,16 @@ gst_player_class_init (GstPlayerClass * klass)
       G_SIGNAL_RUN_LAST | G_SIGNAL_NO_RECURSE | G_SIGNAL_NO_HOOKS, 0, NULL,
       NULL, NULL, G_TYPE_NONE, 1, GST_TYPE_CLOCK_TIME);
 
+  signals[SIGNAL_ELEMENT_MESSAGE] =
+      g_signal_new ("element-message", G_TYPE_FROM_CLASS (klass),
+      G_SIGNAL_RUN_LAST | G_SIGNAL_NO_RECURSE | G_SIGNAL_NO_HOOKS, 0, NULL,
+      NULL, NULL, G_TYPE_NONE, 1, GST_TYPE_MESSAGE);
+
+  signals[SIGNAL_APPLICATION_MESSAGE] =
+      g_signal_new ("application-message", G_TYPE_FROM_CLASS (klass),
+      G_SIGNAL_RUN_LAST | G_SIGNAL_NO_RECURSE | G_SIGNAL_NO_HOOKS, 0, NULL,
+      NULL, NULL, G_TYPE_NONE, 1, GST_TYPE_MESSAGE);
+
   config_quark_initialize ();
 }
 
@@ -503,6 +523,8 @@ gst_player_dispose (GObject * object)
 
     g_main_context_unref (self->context);
     self->context = NULL;
+  } else if (self->use_default_context) {
+    gst_player_dispose_internal (self);
   }
 
   G_OBJECT_CLASS (parent_class)->dispose (object);
@@ -547,9 +569,17 @@ gst_player_constructed (GObject * object)
   GST_TRACE_OBJECT (self, "Constructed");
 
   g_mutex_lock (&self->lock);
-  self->thread = g_thread_new ("GstPlayer", gst_player_main, self);
-  while (!self->loop || !g_main_loop_is_running (self->loop))
-    g_cond_wait (&self->cond, &self->lock);
+  if (!self->use_default_context) {
+    self->context = g_main_context_new ();
+    self->loop = g_main_loop_new (self->context, FALSE);
+    self->thread = g_thread_new ("GstPlayer", gst_player_main, self);
+    while (!self->loop || !g_main_loop_is_running (self->loop))
+      g_cond_wait (&self->cond, &self->lock);
+  } else {
+    /* will not increase ref count */
+    self->context = g_main_context_default ();
+    gst_player_constructed_internal (self);
+  }
   g_mutex_unlock (&self->lock);
 
   G_OBJECT_CLASS (parent_class)->constructed (object);
@@ -734,6 +764,9 @@ gst_player_set_property (GObject * object, guint prop_id,
     case PROP_AUDIO_VIDEO_OFFSET:
       g_object_set_property (G_OBJECT (self->playbin), "av-offset", value);
       break;
+    case PROP_USE_DEFAULT_CONTEXT:
+      self->use_default_context = g_value_get_boolean (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -830,6 +863,9 @@ gst_player_get_property (GObject * object, guint prop_id,
     }
     case PROP_AUDIO_VIDEO_OFFSET:
       g_object_get_property (G_OBJECT (self->playbin), "av-offset", value);
+      break;
+    case PROP_USE_DEFAULT_CONTEXT:
+      g_value_set_boolean (value, self->use_default_context);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -1569,6 +1605,74 @@ emit_seek_done (GstPlayer * self)
   }
 }
 
+typedef struct
+{
+  GstPlayer *player;
+  GstMessage *message;
+} MessageSignalData;
+
+static void
+element_message_dispatch (gpointer user_data)
+{
+  MessageSignalData *data = user_data;
+
+  if (data->player->inhibit_sigs)
+    return;
+
+  g_signal_emit (data->player,
+      signals[SIGNAL_ELEMENT_MESSAGE], 0, data->message);
+}
+
+static void
+message_signal_data_free (MessageSignalData * data)
+{
+  g_object_unref (data->player);
+  gst_message_unref (data->message);
+  g_free (data);
+}
+
+static void
+emit_element_message (GstPlayer * self, GstMessage * msg)
+{
+  if (g_signal_handler_find (self, G_SIGNAL_MATCH_ID,
+          signals[SIGNAL_ELEMENT_MESSAGE], 0, NULL, NULL, NULL) != 0) {
+    MessageSignalData *data = g_new (MessageSignalData, 1);
+
+    data->player = g_object_ref (self);
+    data->message = gst_message_copy (msg);
+    gst_player_signal_dispatcher_dispatch (self->signal_dispatcher, self,
+        element_message_dispatch, data,
+        (GDestroyNotify) message_signal_data_free);
+  }
+}
+
+static void
+application_message_dispatch (gpointer user_data)
+{
+  MessageSignalData *data = user_data;
+
+  if (data->player->inhibit_sigs)
+    return;
+
+  g_signal_emit (data->player,
+      signals[SIGNAL_APPLICATION_MESSAGE], 0, data->message);
+}
+
+static void
+emit_application_message (GstPlayer * self, GstMessage * msg)
+{
+  if (g_signal_handler_find (self, G_SIGNAL_MATCH_ID,
+          signals[SIGNAL_APPLICATION_MESSAGE], 0, NULL, NULL, NULL) != 0) {
+    MessageSignalData *data = g_new (MessageSignalData, 1);
+
+    data->player = g_object_ref (self);
+    data->message = gst_message_copy (msg);
+    gst_player_signal_dispatcher_dispatch (self->signal_dispatcher, self,
+        application_message_dispatch, data,
+        (GDestroyNotify) message_signal_data_free);
+  }
+}
+
 static void
 state_changed_cb (G_GNUC_UNUSED GstBus * bus, GstMessage * msg,
     gpointer user_data)
@@ -1602,12 +1706,14 @@ state_changed_cb (G_GNUC_UNUSED GstBus * bus, GstMessage * msg,
 
       GST_DEBUG_OBJECT (self, "Initial PAUSED - pre-rolled");
 
-      g_mutex_lock (&self->lock);
-      if (self->media_info)
-        g_object_unref (self->media_info);
-      self->media_info = gst_player_media_info_create (self);
-      g_mutex_unlock (&self->lock);
-      emit_media_info_updated_signal (self);
+      if (!self->use_playbin3) {
+        g_mutex_lock (&self->lock);
+        if (self->media_info)
+          g_object_unref (self->media_info);
+        self->media_info = gst_player_media_info_create (self);
+        g_mutex_unlock (&self->lock);
+        emit_media_info_updated_signal (self);
+      }
 
       g_object_get (self->playbin, "video-sink", &video_sink, NULL);
 
@@ -1843,6 +1949,16 @@ element_cb (G_GNUC_UNUSED GstBus * bus, GstMessage * msg, gpointer user_data)
         gst_player_play_internal (self);
     }
   }
+
+  emit_element_message (self, msg);
+}
+
+static void
+application_cb (G_GNUC_UNUSED GstBus * bus, GstMessage * msg,
+    gpointer user_data)
+{
+  GstPlayer *self = GST_PLAYER (user_data);
+  emit_application_message (self, msg);
 }
 
 /* Must be called with lock */
@@ -1857,10 +1973,9 @@ update_stream_collection (GstPlayer * self, GstStreamCollection * collection)
 
   gst_object_replace ((GstObject **) & self->collection,
       (GstObject *) collection);
-  if (self->media_info) {
+  if (self->media_info)
     gst_object_unref (self->media_info);
-    self->media_info = gst_player_media_info_create (self);
-  }
+  self->media_info = gst_player_media_info_create (self);
 
   self->stream_notify_id =
       g_signal_connect (self->collection, "stream-notify",
@@ -2856,25 +2971,24 @@ source_setup_cb (GstElement * playbin, GstElement * source, GstPlayer * self)
   }
 }
 
-static gpointer
-gst_player_main (gpointer data)
+static void
+gst_player_constructed_internal (GstPlayer * self)
 {
-  GstPlayer *self = GST_PLAYER (data);
   GstBus *bus;
   GSource *source;
   GSource *bus_source;
   GstElement *scaletempo;
   const gchar *env;
 
-  GST_TRACE_OBJECT (self, "Starting main thread");
+  if (!self->use_default_context) {
+    g_main_context_push_thread_default (self->context);
 
-  g_main_context_push_thread_default (self->context);
-
-  source = g_idle_source_new ();
-  g_source_set_callback (source, (GSourceFunc) main_loop_running_cb, self,
-      NULL);
-  g_source_attach (source, self->context);
-  g_source_unref (source);
+    source = g_idle_source_new ();
+    g_source_set_callback (source, (GSourceFunc) main_loop_running_cb, self,
+        NULL);
+    g_source_attach (source, self->context);
+    g_source_unref (source);
+  }
 
   env = g_getenv ("GST_PLAYER_USE_PLAYBIN3");
   if (env && g_str_has_prefix (env, "1"))
@@ -2904,7 +3018,7 @@ gst_player_main (gpointer data)
   }
 
   self->bus = bus = gst_element_get_bus (self->playbin);
-  bus_source = gst_bus_create_watch (bus);
+  self->bus_source = bus_source = gst_bus_create_watch (bus);
   g_source_set_callback (bus_source, (GSourceFunc) gst_bus_async_signal_func,
       NULL, NULL);
   g_source_attach (bus_source, self->context);
@@ -2929,6 +3043,8 @@ gst_player_main (gpointer data)
   g_signal_connect (G_OBJECT (bus), "message::element",
       G_CALLBACK (element_cb), self);
   g_signal_connect (G_OBJECT (bus), "message::tag", G_CALLBACK (tags_cb), self);
+  g_signal_connect (G_OBJECT (bus), "message::application",
+      G_CALLBACK (application_cb), self);
 
   if (self->use_playbin3) {
     g_signal_connect (G_OBJECT (bus), "message::stream-collection",
@@ -2965,14 +3081,14 @@ gst_player_main (gpointer data)
   self->is_eos = FALSE;
   self->is_live = FALSE;
   self->rate = 1.0;
+}
 
-  GST_TRACE_OBJECT (self, "Starting main loop");
-  g_main_loop_run (self->loop);
-  GST_TRACE_OBJECT (self, "Stopped main loop");
-
-  g_source_destroy (bus_source);
-  g_source_unref (bus_source);
-  gst_object_unref (bus);
+static void
+gst_player_dispose_internal (GstPlayer * self)
+{
+  g_source_destroy (self->bus_source);
+  g_source_unref (self->bus_source);
+  gst_object_unref (self->bus);
 
   remove_tick_source (self);
   remove_ready_timeout_source (self);
@@ -2986,7 +3102,8 @@ gst_player_main (gpointer data)
   remove_seek_source (self);
   g_mutex_unlock (&self->lock);
 
-  g_main_context_pop_thread_default (self->context);
+  if (!self->use_default_context)
+    g_main_context_pop_thread_default (self->context);
 
   self->target_state = GST_STATE_NULL;
   self->current_state = GST_STATE_NULL;
@@ -2995,6 +3112,22 @@ gst_player_main (gpointer data)
     gst_object_unref (self->playbin);
     self->playbin = NULL;
   }
+}
+
+static gpointer
+gst_player_main (gpointer data)
+{
+  GstPlayer *self = GST_PLAYER (data);
+
+  GST_TRACE_OBJECT (self, "Starting main thread");
+
+  gst_player_constructed_internal (self);
+
+  GST_TRACE_OBJECT (self, "Starting main loop");
+  g_main_loop_run (self->loop);
+  GST_TRACE_OBJECT (self, "Stopped main loop");
+
+  gst_player_dispose_internal (self);
 
   GST_TRACE_OBJECT (self, "Stopped main thread");
 
@@ -3010,6 +3143,14 @@ gst_player_init_once (G_GNUC_UNUSED gpointer user_data)
   gst_player_error_quark ();
 
   return NULL;
+}
+
+static void
+gst_player_new_once (void)
+{
+  static GOnce once = G_ONCE_INIT;
+
+  g_once (&once, gst_player_init_once, NULL);
 }
 
 /**
@@ -3031,15 +3172,51 @@ GstPlayer *
 gst_player_new (GstPlayerVideoRenderer * video_renderer,
     GstPlayerSignalDispatcher * signal_dispatcher)
 {
-  static GOnce once = G_ONCE_INIT;
   GstPlayer *self;
 
-  g_once (&once, gst_player_init_once, NULL);
+  gst_player_new_once ();
 
   self =
       g_object_new (GST_TYPE_PLAYER, "video-renderer", video_renderer,
       "signal-dispatcher", signal_dispatcher, NULL);
   gst_object_ref_sink (self);
+
+  if (video_renderer)
+    g_object_unref (video_renderer);
+  if (signal_dispatcher)
+    g_object_unref (signal_dispatcher);
+
+  return self;
+}
+
+/**
+ * gst_player_new_with_default_context:
+ * @video_renderer: (transfer full) (allow-none): GstPlayerVideoRenderer to use
+ * @signal_dispatcher: (transfer full) (allow-none): GstPlayerSignalDispatcher to use
+ *
+ * Creates a new #GstPlayer instance that uses @signal_dispatcher to dispatch
+ * signals to some event loop system, or emits signals directly if NULL is
+ * passed. See gst_player_g_main_context_signal_dispatcher_new().
+ * Unlike gst_player_new(), #GstPlayer will not make its own mainloop
+ *
+ * Video is going to be rendered by @video_renderer, or if %NULL is provided
+ * no special video set up will be done and some default handling will be
+ * performed.
+ *
+ * Returns: a new #GstPlayer instance
+ */
+GstPlayer *
+gst_player_new_with_default_context (GstPlayerVideoRenderer * video_renderer,
+    GstPlayerSignalDispatcher * signal_dispatcher)
+{
+  GstPlayer *self;
+
+  gst_player_new_once ();
+
+  self =
+      g_object_new (GST_TYPE_PLAYER, "video-renderer", video_renderer,
+      "signal-dispatcher", signal_dispatcher, "use-default-context", TRUE,
+      NULL);
 
   if (video_renderer)
     g_object_unref (video_renderer);

@@ -1871,6 +1871,10 @@ gst_mpdparser_parse_representation_base_type (GstRepresentationBaseType **
               (xmlChar *) "ContentProtection") == 0) {
         gst_mpdparser_parse_content_protection_node
             (&representation_base->ContentProtection, cur_node);
+      } else if (xmlStrcmp (cur_node->name,
+              (xmlChar *) "InbandEventStream") == 0) {
+        gst_mpdparser_parse_descriptor_type_node
+            (&representation_base->InbandEventStream, cur_node);
       }
     }
   }
@@ -2661,7 +2665,7 @@ gst_mpd_client_fetch_external_segment_list (GstMpdClient * client,
 
   download =
       gst_uri_downloader_fetch_uri (client->downloader,
-      uri_string, client->mpd_uri, TRUE, FALSE, TRUE, &err);
+      uri_string, client->mpd_uri, NULL, NULL, TRUE, FALSE, TRUE, &err);
   g_free (uri_string);
 
   if (!download) {
@@ -2902,6 +2906,8 @@ gst_mpdparser_free_representation_base_type (GstRepresentationBaseType *
     g_list_free_full (representation_base->AudioChannelConfiguration,
         (GDestroyNotify) gst_mpdparser_free_descriptor_type_node);
     g_list_free_full (representation_base->ContentProtection,
+        (GDestroyNotify) gst_mpdparser_free_descriptor_type_node);
+    g_list_free_full (representation_base->InbandEventStream,
         (GDestroyNotify) gst_mpdparser_free_descriptor_type_node);
     g_slice_free (GstRepresentationBaseType, representation_base);
   }
@@ -3831,6 +3837,8 @@ gst_mpd_parse (GstMpdClient * client, const gchar * data, gint size)
 
     GST_DEBUG ("MPD file fully buffered, start parsing...");
 
+    GST_TRACE ("data:\n%s", data);
+
     /* parse the complete MPD file into a tree (using the libxml2 default parser API) */
 
     /* this initialize the library and check potential ABI mismatches
@@ -4267,7 +4275,7 @@ gst_mpd_client_fetch_external_period (GstMpdClient * client,
 
   download =
       gst_uri_downloader_fetch_uri (client->downloader,
-      uri_string, client->mpd_uri, TRUE, FALSE, TRUE, &err);
+      uri_string, client->mpd_uri, NULL, NULL, TRUE, FALSE, TRUE, &err);
   g_free (uri_string);
 
   if (!download) {
@@ -4628,7 +4636,7 @@ gst_mpd_client_fetch_external_adaptation_set (GstMpdClient * client,
 
   download =
       gst_uri_downloader_fetch_uri (client->downloader,
-      uri_string, client->mpd_uri, TRUE, FALSE, TRUE, &err);
+      uri_string, client->mpd_uri, NULL, NULL, TRUE, FALSE, TRUE, &err);
   g_free (uri_string);
 
   if (!download) {
@@ -4753,6 +4761,7 @@ gst_mpd_client_setup_streaming (GstMpdClient * client,
   GstRepresentationNode *representation;
   GList *rep_list = NULL;
   GstActiveStream *stream;
+  GList *role_list = NULL;
 
   rep_list = adapt_set->Representations;
   if (!rep_list) {
@@ -4801,6 +4810,18 @@ gst_mpd_client_setup_streaming (GstMpdClient * client,
   if (!gst_mpd_client_setup_representation (client, stream, representation)) {
     GST_WARNING ("Failed to setup the representation, aborting...");
     return FALSE;
+  }
+
+  for (role_list = adapt_set->Role; role_list;
+      role_list = g_list_next (role_list)) {
+    GstDescriptorType *descriptor = role_list->data;
+    if (!g_strcmp0 (descriptor->schemeIdUri, "urn:mpeg:dash:role:2011") &&
+        !g_strcmp0 (descriptor->value, "main")) {
+      GST_INFO ("AdaptationSet %u is default track for mimeType %d",
+          adapt_set->id, stream->mimeType);
+      stream->is_default = TRUE;
+      break;
+    }
   }
 
   GST_INFO ("Successfully setup the download pipeline for mimeType %d",
@@ -4936,7 +4957,7 @@ gst_mpd_client_stream_seek (GstMpdClient * client, GstActiveStream * stream,
       return FALSE;
     }
     if (final_ts)
-      *final_ts = index * duration;
+      *final_ts = stream_period->start + (index * duration);
   }
 
   stream->segment_repeat_index = repeat_index;
@@ -5630,6 +5651,248 @@ gst_mpd_client_get_period_index (GstMpdClient * client)
   return period_idx;
 }
 
+static gboolean
+gst_mpd_client_parse_mpd_anchor_time (GstMpdClient * client, const gchar * time,
+    GstSegment * segment)
+{
+  gint start, stop;
+  gchar *str;
+  guint len, pos;
+  GstClockTime start_time, stop_time;
+
+  g_return_val_if_fail (time != NULL, FALSE);
+  g_return_val_if_fail (segment != NULL, FALSE);
+
+  /* negative number is invalid */
+  if (strstr (time, "-") != NULL) {
+    GST_ERROR ("Negative sign detected");
+    return FALSE;
+  }
+
+  /* Possible formats
+   * "t=start"      [start, -1)
+   * "t=start,"     [start, -1)
+   * "t=,stop"      [0, stop)
+   * "t=start,stop"  [start, stop)
+   */
+  str = (gchar *) time;
+  start = stop = -1;
+  len = strlen (str);
+  pos = strcspn (str, ",");
+
+  if (pos == 0) {
+    str++;
+    len--;
+    if (len > 0) {
+      /* For case "t=,end" */
+      if (sscanf (str, "%d", &stop) != 1)
+        return FALSE;
+    } else {
+      /* For case of "t=," */
+      return FALSE;
+    }
+  } else {
+    if (sscanf (str, "%d", &start) != 1)
+      return FALSE;
+
+    if (pos < len) {
+      str += pos + 1;
+      if (sscanf (str, "%d", &stop) != 1)
+        return FALSE;
+    }
+  }
+
+  start_time = (start == -1) ? 0 : ((guint64) start * GST_SECOND);
+  stop_time = (stop == -1) ? GST_CLOCK_TIME_NONE : (stop * GST_SECOND);
+
+  if (!gst_segment_do_seek (segment, segment->rate, segment->format,
+          GST_SEEK_FLAG_FLUSH, GST_SEEK_TYPE_SET, start_time, GST_SEEK_TYPE_SET,
+          stop_time, NULL))
+    return FALSE;
+
+  GST_DEBUG ("Parsed MPD Anchor time = [%" GST_TIME_FORMAT
+      ", %" GST_TIME_FORMAT ")", GST_TIME_ARGS (start_time),
+      GST_TIME_ARGS (stop_time));
+
+  return TRUE;
+}
+
+/* Find Period Start corresponding to "period_id" and its index */
+static gboolean
+gst_mpd_client_parse_mpd_anchor_period (GstMpdClient * client,
+    const gchar * period_id, GstSegment * segment, guint * idx)
+{
+  GstStreamPeriod *stream_period;
+  GList *iter, *target = NULL;
+  guint period_idx;
+  GstClockTime start, stop, abs_time;
+
+  g_return_val_if_fail (segment != NULL, FALSE);
+  g_return_val_if_fail (segment->start != GST_CLOCK_TIME_NONE, FALSE);
+  g_return_val_if_fail (idx != NULL, FALSE);
+
+  for (period_idx = 0, iter = client->periods; iter; period_idx++,
+      iter = g_list_next (iter)) {
+    stream_period = iter->data;
+
+    if (stream_period->period->id
+        && strcmp (stream_period->period->id, period_id) == 0) {
+      GList *next;
+      GstClockTime duration;
+
+      /* Find period and absolute start time
+       * segment->start is relative time from this period's start  */
+      duration = stream_period->duration;
+      abs_time = segment->start + stream_period->start;
+
+      if (segment->start < duration) {
+        target = iter;
+        goto done;
+      }
+
+      for (next = iter->next; next; period_idx++, next = g_list_next (next)) {
+        GstStreamPeriod *next_period = next->data;
+        duration = next_period->duration;
+        if (abs_time < next_period->start) {
+          target = next->prev;
+          goto done;
+        } else if (abs_time < next_period->start + duration) {
+          target = next;
+          period_idx++;
+          goto done;
+        }
+      }
+    }
+  }
+
+done:
+  if (!target)
+    return FALSE;
+
+  start = abs_time;
+
+  if (GST_CLOCK_TIME_IS_VALID (segment->stop))
+    stop = segment->stop + (abs_time - segment->start);
+  else
+    stop = GST_CLOCK_TIME_NONE;
+
+  if (!gst_segment_do_seek (segment, segment->rate, segment->format,
+          GST_SEEK_FLAG_FLUSH, GST_SEEK_TYPE_SET, start, GST_SEEK_TYPE_SET,
+          stop, NULL))
+    return FALSE;
+
+  if (idx)
+    *idx = period_idx;
+
+  GST_DEBUG ("Parsed MPD Anchor time with period = [%" GST_TIME_FORMAT
+      ", %" GST_TIME_FORMAT ")", GST_TIME_ARGS (start), GST_TIME_ARGS (stop));
+
+  return TRUE;
+}
+
+gboolean
+gst_mpd_client_parse_mpd_anchor (GstMpdClient * client, GstSegment * segment,
+    guint * period_idx)
+{
+  GstUri *uri = NULL;
+  GHashTable *table = NULL;
+  gboolean ret = FALSE;
+
+  g_return_val_if_fail (client != NULL, FALSE);
+  g_return_val_if_fail (client->mpd_uri != NULL, FALSE);
+
+  uri = gst_uri_from_string (client->mpd_uri);
+
+  if (!uri) {
+    GST_ERROR ("Fail to construct uri object");
+    return FALSE;
+  }
+
+  table = gst_uri_get_media_fragment_table (uri);
+
+  /* ISO/IEC 23009-1:2014 Annex C.4 defines MPD Anchor which is to indicate
+   * start time offset, period, and etc */
+  if (table) {
+    const gchar *anchor_period, *anchor_t;
+    guint idx = 0;
+    GstClockTime start, stop, clip_start, clip_stop, duration;
+    GstSegment seg;
+
+    /* TODO: Parse "utc", "as", and "track" paremeters */
+    anchor_period = g_hash_table_lookup (table, "period");
+    anchor_t = g_hash_table_lookup (table, "t");
+
+    /* No MPD anchor parameters */
+    if (!anchor_period && !anchor_t)
+      goto done;
+
+
+    if (!gst_mpd_client_setup_media_presentation (client, GST_CLOCK_TIME_NONE,
+            -1, NULL))
+      goto done;
+
+    /* ISO/IEC 23008-1:2014 Annex C.4.2
+     * if not present, default is the ID of the earlist period */
+    if (!anchor_period) {
+      GstStreamPeriod *stream_period = client->periods->data;
+      anchor_period = stream_period->period->id;
+    }
+
+    /* ISO/IEC 23009-1:2014 Annex C.4.2
+     * if not present, default is "0"  */
+    if (!anchor_t)
+      anchor_t = "0";
+
+    gst_segment_init (&seg, GST_FORMAT_TIME);
+
+    if (anchor_t) {
+      if (!gst_mpd_client_parse_mpd_anchor_time (client, anchor_t, &seg)) {
+        GST_ERROR ("Fail to parse MPD Anchor time");
+        goto done;
+      }
+    }
+
+    if (anchor_period) {
+      if (!gst_mpd_client_parse_mpd_anchor_period (client, anchor_period, &seg,
+              &idx)) {
+        GST_DEBUG ("Fail to parse MPD Anchor period");
+        goto done;
+      }
+    }
+
+    start = gst_mpd_parser_get_period_start_time (client);
+    duration = gst_mpd_client_get_media_presentation_duration (client);
+    stop = GST_CLOCK_TIME_IS_VALID (duration) ?
+        start + duration : GST_CLOCK_TIME_NONE;
+
+    if (!gst_segment_clip (&seg, GST_FORMAT_TIME, start, stop, &clip_start,
+            &clip_stop))
+      goto done;
+
+    gst_segment_do_seek (&seg, 1.0, GST_FORMAT_TIME, GST_SEEK_FLAG_FLUSH,
+        GST_SEEK_TYPE_SET, clip_start, GST_SEEK_TYPE_SET, clip_stop, NULL);
+
+    if (segment)
+      gst_segment_copy_into (&seg, segment);
+
+    if (period_idx)
+      *period_idx = idx;
+
+    GST_DEBUG ("MPD anchor parsed, period index = %u, segment %"
+        GST_SEGMENT_FORMAT, idx, &seg);
+
+    ret = TRUE;
+  }
+
+done:
+  if (table)
+    g_hash_table_unref (table);
+  if (uri)
+    gst_uri_unref (uri);
+
+  return ret;
+}
+
 const gchar *
 gst_mpd_client_get_period_id (GstMpdClient * client)
 {
@@ -5813,7 +6076,7 @@ gst_mpd_client_get_stream_caps (GstActiveStream * stream)
 
   if ((g_strcmp0 (caps_string, "application/mp4") == 0)
       && gst_mpd_client_active_stream_contains_subtitles (stream))
-    caps_string = "video/quicktime";
+    caps_string = "application/x-3gp";
 
   if (caps_string)
     ret = gst_caps_from_string (caps_string);
@@ -5929,6 +6192,146 @@ gst_mpd_client_get_audio_stream_num_channels (GstActiveStream * stream)
     return 0;
   /* TODO: here we have to parse the AudioChannelConfiguration descriptors */
   return 0;
+}
+
+guint
+gst_mpd_client_get_video_stream_max_width (GstActiveStream * stream)
+{
+  guint max_width = 0;
+  GList *iter;
+
+  if (stream == NULL)
+    return 0;
+
+  /* Check AdaptationSet */
+  if (stream->cur_adapt_set) {
+    if (stream->cur_adapt_set->maxWidth != 0) {
+      return stream->cur_adapt_set->maxWidth;
+    }
+
+    for (iter = stream->cur_adapt_set->Representations; iter; iter = iter->next) {
+      GstRepresentationNode *rep = (GstRepresentationNode *) iter->data;
+      if (rep->RepresentationBase && rep->RepresentationBase->width > max_width) {
+        max_width = rep->RepresentationBase->width;
+      }
+    }
+
+    if (max_width)
+      return max_width;
+  }
+
+  /* Check current Representation */
+  if (stream->cur_representation)
+    max_width = stream->cur_representation->RepresentationBase->width;
+
+  if (max_width == 0 && stream->cur_adapt_set) {
+    max_width = stream->cur_adapt_set->RepresentationBase->width;
+  }
+
+  return max_width;
+}
+
+guint
+gst_mpd_client_get_video_stream_max_height (GstActiveStream * stream)
+{
+  guint max_height = 0;
+  GList *iter;
+
+  if (stream == NULL)
+    return 0;
+
+  /* Check AdaptationSet */
+  if (stream->cur_adapt_set) {
+    if (stream->cur_adapt_set->maxHeight != 0) {
+      return stream->cur_adapt_set->maxHeight;
+    }
+
+    for (iter = stream->cur_adapt_set->Representations; iter; iter = iter->next) {
+      GstRepresentationNode *rep = (GstRepresentationNode *) iter->data;
+      if (rep->RepresentationBase &&
+          rep->RepresentationBase->height > max_height) {
+        max_height = rep->RepresentationBase->height;
+      }
+    }
+
+    if (max_height)
+      return max_height;
+  }
+
+  /* Check current Representation */
+  if (stream->cur_representation)
+    max_height = stream->cur_representation->RepresentationBase->height;
+
+  if (max_height == 0 && stream->cur_adapt_set) {
+    max_height = stream->cur_adapt_set->RepresentationBase->height;
+  }
+
+  return max_height;
+}
+
+gboolean
+gst_mpd_client_get_video_stream_max_framerate (GstActiveStream * stream,
+    gint * fps_num, gint * fps_den)
+{
+  GList *iter;
+  GstFrameRate max_rate = { 0, 1 };
+
+  if (stream == NULL)
+    return FALSE;
+
+  if (stream->cur_adapt_set &&
+      stream->cur_adapt_set->RepresentationBase->maxFrameRate != NULL) {
+    *fps_num = stream->cur_adapt_set->RepresentationBase->maxFrameRate->num;
+    *fps_den = stream->cur_adapt_set->RepresentationBase->maxFrameRate->den;
+    return TRUE;
+  }
+
+  if (stream->cur_representation &&
+      stream->cur_representation->RepresentationBase->maxFrameRate != NULL) {
+    *fps_num =
+        stream->cur_representation->RepresentationBase->maxFrameRate->num;
+    *fps_den =
+        stream->cur_representation->RepresentationBase->maxFrameRate->den;
+    return TRUE;
+  }
+
+  /* Compare all frameRate of Representations */
+  if (stream->cur_adapt_set) {
+    for (iter = stream->cur_adapt_set->Representations; iter; iter = iter->next) {
+      GstRepresentationNode *rep = (GstRepresentationNode *) iter->data;
+      GstFrameRate *frameRate = rep->RepresentationBase->frameRate;
+      if (frameRate &&
+          gst_util_fraction_compare (max_rate.num, max_rate.den,
+              frameRate->num, frameRate->den) < 0) {
+        max_rate.num = frameRate->num;
+        max_rate.den = frameRate->den;
+      }
+    }
+
+    if (max_rate.num && max_rate.num) {
+      *fps_num = max_rate.num;
+      *fps_den = max_rate.den;
+
+      return TRUE;
+    }
+  }
+
+  /* Check current Representation */
+  if (stream->cur_adapt_set &&
+      stream->cur_adapt_set->RepresentationBase->frameRate != NULL) {
+    *fps_num = stream->cur_adapt_set->RepresentationBase->frameRate->num;
+    *fps_den = stream->cur_adapt_set->RepresentationBase->frameRate->den;
+    return TRUE;
+  }
+
+  if (stream->cur_representation &&
+      stream->cur_representation->RepresentationBase->frameRate != NULL) {
+    *fps_num = stream->cur_representation->RepresentationBase->frameRate->num;
+    *fps_den = stream->cur_representation->RepresentationBase->frameRate->den;
+    return TRUE;
+  }
+
+  return FALSE;
 }
 
 guint

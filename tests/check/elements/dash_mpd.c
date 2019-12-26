@@ -2628,6 +2628,135 @@ GST_START_TEST (dash_mpdparser_utctiming_invalid_value)
 GST_END_TEST;
 
 /*
+ * Test parsing MPD Anchor in Media Fragment URI
+ */
+GST_START_TEST (dash_mpdparser_mpd_anchor)
+{
+  const gchar *xml =
+      "<?xml version=\"1.0\"?>"
+      "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\""
+      "     profiles=\"urn:mpeg:dash:profile:isoff-main:2011\""
+      "     availabilityStartTime=\"2015-03-24T0:0:0\""
+      "     mediaPresentationDuration=\"PT40S\">"
+      "  <Period id=\"Period0\"></Period>"
+      "  <Period id=\"Period1\" start=\"PT10S\"></Period>"
+      "  <Period id=\"Period2\" start=\"PT20S\"></Period></MPD>";
+  gboolean ret;
+  guint period_index;
+  GstSegment segment;
+  GstMpdClient *mpdclient = gst_mpd_client_new ();
+  ret = gst_mpd_parse (mpdclient, xml, (gint) strlen (xml));
+
+  assert_equals_int (ret, TRUE);
+  fail_if (mpdclient->mpd_node == NULL);
+
+  gst_segment_init (&segment, GST_FORMAT_TIME);
+
+  /*
+   * Test "t" paremeter only
+   */
+  mpdclient->mpd_uri = g_strdup ("http://mympd.mpd#t=10");
+  ret = gst_mpd_client_parse_mpd_anchor (mpdclient, &segment, &period_index);
+  g_free (mpdclient->mpd_uri);
+  assert_equals_int (ret, TRUE);
+  fail_unless (segment.start == 10 * GST_SECOND);
+  fail_unless (segment.stop == 40 * GST_SECOND);
+  fail_unless (period_index == 1);
+
+  mpdclient->mpd_uri = g_strdup ("http://mympd.mpd#t=5,20");
+  ret = gst_mpd_client_parse_mpd_anchor (mpdclient, &segment, &period_index);
+  g_free (mpdclient->mpd_uri);
+  assert_equals_int (ret, TRUE);
+  fail_unless (segment.start == 5 * GST_SECOND);
+  fail_unless (segment.stop == 20 * GST_SECOND);
+  fail_unless (period_index == 0);
+
+  mpdclient->mpd_uri = g_strdup ("http://mympd.mpd#t=,40");
+  ret = gst_mpd_client_parse_mpd_anchor (mpdclient, &segment, &period_index);
+  g_free (mpdclient->mpd_uri);
+  assert_equals_int (ret, TRUE);
+  fail_unless (segment.start == 0);
+  fail_unless (segment.stop == 40 * GST_SECOND);
+  fail_unless (period_index == 0);
+
+  /* start at the end of mpd */
+  mpdclient->mpd_uri = g_strdup ("http://mympd.mpd#t=40");
+  ret = gst_mpd_client_parse_mpd_anchor (mpdclient, &segment, &period_index);
+  g_free (mpdclient->mpd_uri);
+  assert_equals_int (ret, FALSE);
+
+  /*
+   * Test "period" paremeter only
+   */
+  mpdclient->mpd_uri = g_strdup ("http://mympd.mpd#period=Period0");
+  ret = gst_mpd_client_parse_mpd_anchor (mpdclient, &segment, &period_index);
+  g_free (mpdclient->mpd_uri);
+  assert_equals_int (ret, TRUE);
+  fail_unless (segment.start == 0 * GST_SECOND);
+  fail_unless (segment.stop == 40 * GST_SECOND);
+  fail_unless (period_index == 0);
+
+  mpdclient->mpd_uri = g_strdup ("http://mympd.mpd#period=Period1");
+  ret = gst_mpd_client_parse_mpd_anchor (mpdclient, &segment, &period_index);
+  g_free (mpdclient->mpd_uri);
+  assert_equals_int (ret, TRUE);
+  fail_unless (segment.start == 10 * GST_SECOND);
+  fail_unless (segment.stop == 40 * GST_SECOND);
+  fail_unless (period_index == 1);
+
+  mpdclient->mpd_uri = g_strdup ("http://mympd.mpd#period=Period2");
+  ret = gst_mpd_client_parse_mpd_anchor (mpdclient, &segment, &period_index);
+  g_free (mpdclient->mpd_uri);
+  assert_equals_int (ret, TRUE);
+  fail_unless (segment.start == 20 * GST_SECOND);
+  fail_unless (segment.stop == 40 * GST_SECOND);
+  fail_unless (period_index == 2);
+
+  mpdclient->mpd_uri = g_strdup ("http://mympd.mpd#period=Unknown");
+  ret = gst_mpd_client_parse_mpd_anchor (mpdclient, &segment, &period_index);
+  g_free (mpdclient->mpd_uri);
+  assert_equals_int (ret, FALSE);
+
+  /*
+   * Test "t" paremeter with "period"
+   */
+  mpdclient->mpd_uri = g_strdup ("http://mympd.mpd#t=0&period=Period0");
+  ret = gst_mpd_client_parse_mpd_anchor (mpdclient, &segment, &period_index);
+  g_free (mpdclient->mpd_uri);
+  assert_equals_int (ret, TRUE);
+  fail_unless (segment.start == 0 * GST_SECOND);
+  fail_unless (segment.stop == 40 * GST_SECOND);
+  fail_unless (period_index == 0);
+
+  mpdclient->mpd_uri = g_strdup ("http://mympd.mpd#t=5&period=Period1");
+  ret = gst_mpd_client_parse_mpd_anchor (mpdclient, &segment, &period_index);
+  g_free (mpdclient->mpd_uri);
+  assert_equals_int (ret, TRUE);
+  fail_unless (segment.start == 15 * GST_SECOND);
+  fail_unless (segment.stop == 40 * GST_SECOND);
+  fail_unless (period_index == 1);
+
+  mpdclient->mpd_uri = g_strdup ("http://mympd.mpd#t=10&period=Period0");
+  ret = gst_mpd_client_parse_mpd_anchor (mpdclient, &segment, &period_index);
+  g_free (mpdclient->mpd_uri);
+  assert_equals_int (ret, TRUE);
+  fail_unless (segment.start == 10 * GST_SECOND);
+  fail_unless (segment.stop == 40 * GST_SECOND);
+  fail_unless (period_index == 1);
+
+  mpdclient->mpd_uri = g_strdup ("http://mympd.mpd#t=10&period=Period2");
+  ret = gst_mpd_client_parse_mpd_anchor (mpdclient, &segment, &period_index);
+  assert_equals_int (ret, TRUE);
+  fail_unless (segment.start == 30 * GST_SECOND);
+  fail_unless (segment.stop == 40 * GST_SECOND);
+  fail_unless (period_index == 2);
+
+  gst_mpd_client_free (mpdclient);
+}
+
+GST_END_TEST;
+
+/*
  * Test parsing the type property: value "dynamic"
  *
  */
@@ -5955,6 +6084,7 @@ dash_suite (void)
   tcase_add_test (tc_simpleMPD, dash_mpdparser_period_subset);
   tcase_add_test (tc_simpleMPD, dash_mpdparser_utctiming);
   tcase_add_test (tc_simpleMPD, dash_mpdparser_utctiming_invalid_value);
+  tcase_add_test (tc_simpleMPD, dash_mpdparser_mpd_anchor);
 
   /* tests checking other possible values for attributes */
   tcase_add_test (tc_simpleMPD, dash_mpdparser_type_dynamic);

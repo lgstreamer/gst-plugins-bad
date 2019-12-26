@@ -110,6 +110,7 @@ GType        gst_player_get_type                      (void);
 
 GST_PLAYER_API
 GstPlayer *  gst_player_new                           (GstPlayerVideoRenderer * video_renderer, GstPlayerSignalDispatcher * signal_dispatcher);
+GstPlayer *  gst_player_new_with_default_context      (GstPlayerVideoRenderer * video_renderer, GstPlayerSignalDispatcher * signal_dispatcher);
 
 GST_PLAYER_API
 void         gst_player_play                          (GstPlayer    * player);

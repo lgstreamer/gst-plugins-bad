@@ -35,27 +35,29 @@
 
 #include "gstmpeg4videoparse.h"
 
+#ifndef ABS
+#define ABS(x) ((x) < 0 ? (-(x)) : (x))      /**< Absolute integer value. */
+#endif
+
 GST_DEBUG_CATEGORY (mpeg4v_parse_debug);
 #define GST_CAT_DEFAULT mpeg4v_parse_debug
 
 static GstStaticPadTemplate src_template =
-    GST_STATIC_PAD_TEMPLATE ("src", GST_PAD_SRC,
+GST_STATIC_PAD_TEMPLATE ("src", GST_PAD_SRC,
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS ("video/mpeg, "
         "mpegversion = (int) 4, "
         "width = (int)[ 0, max ], "
         "height = (int)[ 0, max ], "
         "framerate = (fraction)[ 0, max ] ,"
-        "parsed = (boolean) true, " "systemstream = (boolean) false; "
-        "video/x-divx, " "divxversion = (int) [ 4, 5 ]")
+        "parsed = (boolean) true, " "systemstream = (boolean) false")
     );
 
 static GstStaticPadTemplate sink_template =
-    GST_STATIC_PAD_TEMPLATE ("sink", GST_PAD_SINK,
+GST_STATIC_PAD_TEMPLATE ("sink", GST_PAD_SINK,
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS ("video/mpeg, "
-        "mpegversion = (int) 4, " "systemstream = (boolean) false; "
-        "video/x-divx, " "divxversion = (int) [ 4, 5 ]")
+        "mpegversion = (int) 4, " "systemstream = (boolean) false")
     );
 
 /* Properties */
@@ -183,7 +185,9 @@ gst_mpeg4vparse_init (GstMpeg4VParse * parse)
   parse->interval = DEFAULT_CONFIG_INTERVAL;
   parse->last_report = GST_CLOCK_TIME_NONE;
 
+  parse->vol_present = FALSE;
   gst_base_parse_set_pts_interpolation (GST_BASE_PARSE (parse), FALSE);
+  parse->prev_pts = parse->prev_dts = GST_CLOCK_TIME_NONE;
   GST_PAD_SET_ACCEPT_INTERSECT (GST_BASE_PARSE_SINK_PAD (parse));
   GST_PAD_SET_ACCEPT_TEMPLATE (GST_BASE_PARSE_SINK_PAD (parse));
 }
@@ -303,7 +307,48 @@ gst_mpeg4vparse_process_config (GstMpeg4VParse * mp4vparse,
   /* trigger src caps update */
   mp4vparse->update_caps = TRUE;
 
+  if (!mp4vparse->vol_present)
+    mp4vparse->vol_present = TRUE;
+
   return TRUE;
+}
+
+static gboolean
+gst_mpeg4vparse_get_vop_coded (GstMpeg4VParse * mp4vparse, const guint8 * data,
+    gint vop_offset, gsize size, gsize frame_size)
+{
+  if (frame_size > 9) {         /* assuming bigger frame will always have vop_coded (saves some parsing) */
+    return TRUE;
+  } else if (size > vop_offset + 3) {
+    GstBitReader reader;
+    guint8 value;
+
+    gst_bit_reader_init (&reader, data + vop_offset + 1, size - vop_offset);
+    gst_bit_reader_skip (&reader, 2);   /* VOP_coding_type */
+
+    /* modulo_time_base (ends with 0) */
+    while (gst_bit_reader_get_bits_uint8 (&reader, &value, 1) && value);
+
+    /* marker_bit */
+    g_return_val_if_fail (gst_bit_reader_get_bits_uint8 (&reader, &value, 1)
+        && value, TRUE);
+
+    /* VOP_time_increment */
+    gst_bit_reader_skip (&reader, mp4vparse->vol.vop_time_increment_bits);
+
+    /* marker_bit */
+    g_return_val_if_fail (gst_bit_reader_get_bits_uint8 (&reader, &value, 1)
+        && value, TRUE);
+
+    /* VOP_coded */
+    if (!gst_bit_reader_get_bits_uint8 (&reader, &value, 1)) {
+      return FALSE;
+    }
+
+    return value;
+  }
+
+  return FALSE;
 }
 
 /* caller guarantees at least start code in @buf at @off */
@@ -318,7 +363,12 @@ gst_mpeg4vparse_process_sc (GstMpeg4VParse * mp4vparse, GstMpeg4Packet * packet,
    * except for final VOS end sequence code included in last VOP-frame */
   if (mp4vparse->vop_offset >= 0 &&
       packet->type != GST_MPEG4_VISUAL_OBJ_SEQ_END) {
-    GST_LOG_OBJECT (mp4vparse, "ending frame of size %d", packet->offset - 3);
+    mp4vparse->vop_coded =
+        gst_mpeg4vparse_get_vop_coded (mp4vparse, packet->data,
+        mp4vparse->vop_offset, size, packet->offset - 3);
+    GST_LOG_OBJECT (mp4vparse,
+        "ending frame of size %d, vop_coded %d",
+        packet->offset - 3, mp4vparse->vop_coded);
     return TRUE;
   }
 
@@ -392,6 +442,100 @@ gst_mpeg4vparse_process_sc (GstMpeg4VParse * mp4vparse, GstMpeg4Packet * packet,
   return FALSE;
 }
 
+/*arun.s for VOL header*/
+static void
+gst_vol_write_bits (guint8 * buffer, gint data, gint numbits,
+    gint * bit_offset, gint * byte_offset)
+{
+  const static guint8 masks[] =
+      { 0x01, 0x03, 0x07, 0x0F, 0x1F, 0x3F, 0x7F, 0xFF };
+
+  if (((*bit_offset) != 0) && (((*bit_offset) + numbits) > 8)) {
+    gint numwritebits;
+    guint8 bitstowrite;
+
+    numwritebits = 8 - (*bit_offset);
+    bitstowrite =
+        (guint8) ((data >> (numbits - numwritebits)) << (8 - (*bit_offset) -
+            numwritebits));
+    buffer[(*byte_offset)] |= bitstowrite;
+    numbits -= numwritebits;
+    (*bit_offset) = 0;
+    (*byte_offset)++;
+  }
+
+  while (numbits >= 8) {
+    guint8 bitstowrite;
+
+    bitstowrite = (guint8) ((data >> (numbits - 8)) & 0xFF);
+    buffer[(*byte_offset)] |= bitstowrite;
+    numbits -= 8;
+    (*bit_offset) = 0;
+    (*byte_offset)++;
+  }
+
+  if (numbits > 0) {
+    guint8 bitstowrite;
+    bitstowrite =
+        (guint8) ((data & masks[numbits]) << (8 - (*bit_offset) - numbits));
+    buffer[(*byte_offset)] |= bitstowrite;
+    (*bit_offset) += numbits;
+    if ((*bit_offset) == 8) {
+      (*byte_offset)++;
+      (*bit_offset) = 0;
+    }
+  }
+}
+
+/*arun.s To generate the VOL header if stream does not have*/
+static gint
+gst_mpeg4vparse_write_vol (guint8 * data, guint8 * frame, gsize length,
+    guint16 timeresolution, guint16 width, guint16 height)
+{
+  gint bit_offset = 0;
+  gint byte_offset = 0;
+  gst_vol_write_bits (data, 0x00000100, 32, &bit_offset, &byte_offset); //video object start code
+  gst_vol_write_bits (data, 0x00000120, 32, &bit_offset, &byte_offset); //video_object_layer_start_code
+  gst_vol_write_bits (data, 0, 1, &bit_offset, &byte_offset);;  //random access vol
+  gst_vol_write_bits (data, 0x11, 8, &bit_offset, &byte_offset);;       //video obeject type indication
+  gst_vol_write_bits (data, 1, 1, &bit_offset, &byte_offset);;  //object layer identification
+  gst_vol_write_bits (data, 0x2, 4, &bit_offset, &byte_offset);;        //video_object_layer_verid
+  gst_vol_write_bits (data, 0, 3, &bit_offset, &byte_offset);;  //video_object_layer_priority
+  gst_vol_write_bits (data, 0x1, 4, &bit_offset, &byte_offset); //aspect_ratio
+  gst_vol_write_bits (data, 0, 1, &bit_offset, &byte_offset);   //vol_control_parameters
+  gst_vol_write_bits (data, 0, 2, &bit_offset, &byte_offset);   //video_object_layer_shape
+  gst_vol_write_bits (data, 1, 1, &bit_offset, &byte_offset);   //marker_bit
+  gst_vol_write_bits (data, timeresolution, 16, &bit_offset, &byte_offset);     //ticks pers sec
+  gst_vol_write_bits (data, 1, 1, &bit_offset, &byte_offset);   //marker_bit
+  gst_vol_write_bits (data, 0, 1, &bit_offset, &byte_offset);   //fixed_vop_rate
+  gst_vol_write_bits (data, 1, 1, &bit_offset, &byte_offset);   //marker_bit
+  gst_vol_write_bits (data, width, 13, &bit_offset, &byte_offset);
+  gst_vol_write_bits (data, 1, 1, &bit_offset, &byte_offset);   //marker_bit
+  gst_vol_write_bits (data, height, 13, &bit_offset, &byte_offset);
+  gst_vol_write_bits (data, 1, 1, &bit_offset, &byte_offset);   //marker_bit
+  gst_vol_write_bits (data, 0, 1, &bit_offset, &byte_offset);   //interlaced
+  gst_vol_write_bits (data, 1, 1, &bit_offset, &byte_offset);   //obmc_disable
+  gst_vol_write_bits (data, 0x0, 2, &bit_offset, &byte_offset); //sprite_enable
+  gst_vol_write_bits (data, 0, 1, &bit_offset, &byte_offset);
+  gst_vol_write_bits (data, 0, 1, &bit_offset, &byte_offset);
+  gst_vol_write_bits (data, 0, 1, &bit_offset, &byte_offset);
+  gst_vol_write_bits (data, 1, 1, &bit_offset, &byte_offset);
+  gst_vol_write_bits (data, 1, 1, &bit_offset, &byte_offset);
+  gst_vol_write_bits (data, 0, 1, &bit_offset, &byte_offset);
+  gst_vol_write_bits (data, 0, 1, &bit_offset, &byte_offset);
+  gst_vol_write_bits (data, 0, 1, &bit_offset, &byte_offset);
+  gst_vol_write_bits (data, 0, 1, &bit_offset, &byte_offset);
+  gst_vol_write_bits (data, 0, 1, &bit_offset, &byte_offset);
+  gst_vol_write_bits (data, 1, 8, &bit_offset, &byte_offset);
+  gst_vol_write_bits (data, 0, 1, &bit_offset, &byte_offset);
+  gst_vol_write_bits (data, 0, 1, &bit_offset, &byte_offset);
+
+  memcpy (data + byte_offset, frame, length);
+
+  return byte_offset;
+
+}
+
 static GstFlowReturn
 gst_mpeg4vparse_handle_frame (GstBaseParse * parse,
     GstBaseParseFrame * frame, gint * skipsize)
@@ -400,6 +544,7 @@ gst_mpeg4vparse_handle_frame (GstBaseParse * parse,
   GstMpeg4Packet packet;
   GstMapInfo map;
   guint8 *data = NULL;
+  guint8 *buff = NULL;
   gsize size;
   gint off = 0;
   gboolean ret = FALSE;
@@ -413,6 +558,17 @@ gst_mpeg4vparse_handle_frame (GstBaseParse * parse,
   gst_buffer_map (frame->buffer, &map, GST_MAP_READ);
   data = map.data;
   size = map.size;
+
+  /*if VOL is not present we need to attache the generated VOL header */
+  if (data[0] == 0x00 && data[1] == 0x00 && data[2] == 0x01 && data[3] == 0xB6
+      && !mp4vparse->vol_present) {
+    GST_INFO ("prefixing VOL");
+    buff = g_malloc0 (32 + size);
+    gst_mpeg4vparse_write_vol (buff, data, size, mp4vparse->fps_num,
+        mp4vparse->width, mp4vparse->height);
+    data = buff;
+    size += 32;
+  }
 
 retry:
   /* at least start code and subsequent byte */
@@ -515,14 +671,32 @@ next:
 
 out:
   gst_buffer_unmap (frame->buffer, &map);
+  g_free (buff);
 
   if (ret) {
-    GstFlowReturn res;
-
     g_assert (framesize <= map.size);
-    res = gst_mpeg4vparse_parse_frame (parse, frame);
-    if (res == GST_BASE_PARSE_FLOW_DROPPED)
-      frame->flags |= GST_BASE_PARSE_FRAME_FLAG_DROP;
+    gst_mpeg4vparse_parse_frame (parse, frame);
+
+    if (mp4vparse->prev_pts != GST_CLOCK_TIME_NONE &&
+        (parse->segment.rate >= 0 && parse->segment.rate <= 2)
+        && (GST_BUFFER_PTS (frame->buffer) == GST_CLOCK_TIME_NONE
+            || ABS (GST_BUFFER_PTS (frame->buffer) - mp4vparse->prev_pts) <
+            10)) {
+
+      GST_BUFFER_PTS (frame->buffer) =
+          mp4vparse->prev_pts + GST_BUFFER_DURATION (frame->buffer);
+      if (GST_CLOCK_TIME_IS_VALID (mp4vparse->prev_dts)) {
+        GST_BUFFER_DTS (frame->buffer) =
+            mp4vparse->prev_dts + GST_BUFFER_DURATION (frame->buffer);
+      }
+      gst_base_parse_set_next_timestamp (parse, GST_BUFFER_PTS (frame->buffer),
+          GST_BUFFER_DTS (frame->buffer));
+      GST_INFO_OBJECT (parse, "change PTS with next PTS: %" GST_TIME_FORMAT,
+          GST_TIME_ARGS (GST_BUFFER_PTS (frame->buffer)));
+    }
+    mp4vparse->prev_pts = GST_BUFFER_PTS (frame->buffer);
+    mp4vparse->prev_dts = GST_BUFFER_DTS (frame->buffer);
+
     if (G_UNLIKELY (mp4vparse->discont)) {
       GST_BUFFER_FLAG_SET (frame->buffer, GST_BUFFER_FLAG_DISCONT);
       mp4vparse->discont = FALSE;
@@ -555,11 +729,11 @@ gst_mpeg4vparse_update_src_caps (GstMpeg4VParse * mp4vparse)
     s = gst_caps_get_structure (caps, 0);
   } else {
     caps = gst_caps_new_simple ("video/mpeg",
-        "mpegversion", G_TYPE_INT, 4,
-        "systemstream", G_TYPE_BOOLEAN, FALSE, NULL);
+        "mpegversion", G_TYPE_INT, 4, NULL);
   }
 
-  gst_caps_set_simple (caps, "parsed", G_TYPE_BOOLEAN, TRUE, NULL);
+  gst_caps_set_simple (caps, "systemstream", G_TYPE_BOOLEAN, FALSE,
+      "parsed", G_TYPE_BOOLEAN, TRUE, NULL);
 
   if (mp4vparse->profile && mp4vparse->level) {
     gst_caps_set_simple (caps, "profile", G_TYPE_STRING, mp4vparse->profile,
@@ -608,6 +782,9 @@ gst_mpeg4vparse_update_src_caps (GstMpeg4VParse * mp4vparse)
     gst_caps_set_simple (caps, "sprite-warping-points", G_TYPE_INT,
         mp4vparse->vol.no_of_sprite_warping_points, NULL);
 
+  gst_caps_set_simple (caps, "Scan_Type", G_TYPE_UINT,
+      mp4vparse->vol.interlaced ? 1 : 0, NULL);
+
   gst_pad_set_caps (GST_BASE_PARSE_SRC_PAD (mp4vparse), caps);
   gst_caps_unref (caps);
 
@@ -640,6 +817,11 @@ gst_mpeg4vparse_parse_frame (GstBaseParse * parse, GstBaseParseFrame * frame)
     GST_BUFFER_FLAG_UNSET (buffer, GST_BUFFER_FLAG_DELTA_UNIT);
   else
     GST_BUFFER_FLAG_SET (buffer, GST_BUFFER_FLAG_DELTA_UNIT);
+
+  if (!mp4vparse->vop_coded) {  /* buffer without VOP_coded has no data */
+    GST_BUFFER_DURATION (buffer) = 0;
+    frame->flags |= GST_BASE_PARSE_FRAME_FLAG_DROP;
+  }
 
   if (G_UNLIKELY (mp4vparse->drop && !mp4vparse->config)) {
     GST_LOG_OBJECT (mp4vparse, "dropping frame as no config yet");
@@ -836,6 +1018,13 @@ gst_mpeg4vparse_set_caps (GstBaseParse * parse, GstCaps * caps)
   GST_DEBUG_OBJECT (parse, "setcaps called with %" GST_PTR_FORMAT, caps);
 
   s = gst_caps_get_structure (caps, 0);
+  /*for VOL header these lines are added */
+  gst_structure_get_int (s, "width", &mp4vparse->width);
+  gst_structure_get_int (s, "height", &mp4vparse->height);
+  gst_structure_get_fraction (s, "framerate", &mp4vparse->fps_num,
+      &mp4vparse->fps_den);
+  GST_INFO ("width = %d height = %d,frame num = %d", mp4vparse->width,
+      mp4vparse->height, mp4vparse->fps_num);
 
   if ((value = gst_structure_get_value (s, "codec_data")) != NULL
       && (buf = gst_value_get_buffer (value))) {

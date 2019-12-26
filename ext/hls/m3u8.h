@@ -30,6 +30,7 @@ G_BEGIN_DECLS
 
 typedef struct _GstM3U8 GstM3U8;
 typedef struct _GstM3U8MediaFile GstM3U8MediaFile;
+typedef struct _GstM3U8InitFile GstM3U8InitFile;
 typedef struct _GstHLSMedia GstHLSMedia;
 typedef struct _GstM3U8Client GstM3U8Client;
 typedef struct _GstHLSVariantStream GstHLSVariantStream;
@@ -48,6 +49,16 @@ typedef struct _GstHLSMasterPlaylist GstHLSMasterPlaylist;
    "Playing the Playlist file" of the HLS draft states that this
    value is three fragments */
 #define GST_M3U8_LIVE_MIN_FRAGMENT_DISTANCE 3
+
+typedef enum
+{
+  GST_HLS_MEDIA_TYPE_INVALID = -1,
+  GST_HLS_MEDIA_TYPE_AUDIO,
+  GST_HLS_MEDIA_TYPE_VIDEO,
+  GST_HLS_MEDIA_TYPE_SUBTITLES,
+  GST_HLS_MEDIA_TYPE_CLOSED_CAPTIONS,
+  GST_HLS_N_MEDIA_TYPES
+} GstHLSMediaType;
 
 struct _GstM3U8
 {
@@ -75,12 +86,17 @@ struct _GstM3U8
   GstClockTime last_file_end;         /* timecode of the end of the last fragment in the current media playlist */
   GstClockTime duration;              /* cached total duration */
   gint discont_sequence;              /* currently expected EXT-X-DISCONTINUITY-SEQUENCE */
+  GstClockTime reload_interval;       /* Live reload interval */
+  gboolean has_start;                 /* Has EXT-X-START */
+  gdouble start_time_offset;          /* TIME-OFFSET of EXT-X-START */
 
   /*< private > */
   gchar *last_data;
   GMutex lock;
 
   gint ref_count;               /* ATOMIC */
+  gchar *media_name;            /* For rendition playlists keep track of the name and type */
+  GstHLSMediaType media_type;
 };
 
 GstM3U8 *          gst_m3u8_ref   (GstM3U8 * m3u8);
@@ -96,14 +112,26 @@ struct _GstM3U8MediaFile
   gint64 sequence;               /* the sequence nb of this file */
   gboolean discont;             /* this file marks a discontinuity */
   gchar *key;
+  gchar *protection_meta;
   guint8 iv[16];
   gint64 offset, size;
   gint ref_count;               /* ATOMIC */
+
+  GstM3U8InitFile *init_file;   /* Media Initialization corresponding to
+                                 * current segment, if exist (hold ref) */
+
 };
 
 GstM3U8MediaFile * gst_m3u8_media_file_ref   (GstM3U8MediaFile * mfile);
 
 void               gst_m3u8_media_file_unref (GstM3U8MediaFile * mfile);
+
+struct _GstM3U8InitFile
+{
+  gchar *uri;
+  gint64 offset, size;
+  gint ref_count;               /* ATOMIC */
+};
 
 GstM3U8 *          gst_m3u8_new (void);
 
@@ -123,12 +151,14 @@ GstM3U8MediaFile * gst_m3u8_get_next_fragment    (GstM3U8      * m3u8,
 gboolean           gst_m3u8_has_next_fragment    (GstM3U8 * m3u8,
                                                   gboolean  forward);
 
-void               gst_m3u8_advance_fragment     (GstM3U8 * m3u8,
+gboolean           gst_m3u8_advance_fragment     (GstM3U8 * m3u8,
                                                   gboolean  forward);
 
 GstClockTime       gst_m3u8_get_duration         (GstM3U8 * m3u8);
 
 GstClockTime       gst_m3u8_get_target_duration  (GstM3U8 * m3u8);
+
+GstClockTime       gst_m3u8_get_reload_interval  (GstM3U8 * m3u8);
 
 gchar *            gst_m3u8_get_uri              (GstM3U8 * m3u8);
 
@@ -137,16 +167,6 @@ gboolean           gst_m3u8_is_live              (GstM3U8 * m3u8);
 gboolean           gst_m3u8_get_seek_range       (GstM3U8 * m3u8,
                                                   gint64  * start,
                                                   gint64  * stop);
-
-typedef enum
-{
-  GST_HLS_MEDIA_TYPE_INVALID = -1,
-  GST_HLS_MEDIA_TYPE_AUDIO,
-  GST_HLS_MEDIA_TYPE_VIDEO,
-  GST_HLS_MEDIA_TYPE_SUBTITLES,
-  GST_HLS_MEDIA_TYPE_CLOSED_CAPTIONS,
-  GST_HLS_N_MEDIA_TYPES
-} GstHLSMediaType;
 
 struct _GstHLSMedia {
   GstHLSMediaType mtype;
@@ -157,16 +177,38 @@ struct _GstHLSMedia {
   gboolean is_default;
   gboolean autoselect;
   gboolean forced;
+  gint channels;
 
   GstM3U8 *playlist;            /* media playlist */
 
   gint ref_count;               /* ATOMIC */
+  gint track_order;
 };
 
 GstHLSMedia * gst_hls_media_ref   (GstHLSMedia * media);
 
 void          gst_hls_media_unref (GstHLSMedia * media);
 
+/* TODO: What about preference for ac-4? */
+typedef enum
+{
+  GST_HLS_AUDIO_CODEC_UNKNOWN = -1,
+  GST_HLS_AUDIO_CODEC_MP4A = 0,     /* mp4a */
+  GST_HLS_AUDIO_CODEC_AC3,          /* ac-3 */
+  GST_HLS_AUDIO_CODEC_EC3,          /* ec-3 */
+  GST_HLS_AUDIO_CODEC_EC3P,         /* ec+3 */
+} GstHLSAudioCodecPreference;
+
+typedef enum
+{
+  GST_HLS_VIDEO_CODEC_UNKNOWN = -1,
+  GST_HLS_VIDEO_CODEC_H264 = 0,     /* h264 */
+  GST_HLS_VIDEO_CODEC_HEVC,         /* hevc */
+  GST_HLS_VIDEO_CODEC_DVAV,         /* dvav */
+  GST_HLS_VIDEO_CODEC_DVHE,         /* dvhe */
+  GST_HLS_VIDEO_CODEC_DVH1          /* dvh1 */
+
+} GstHLSVideoCodecPreference;
 
 struct _GstHLSVariantStream {
   gchar *name;         /* This will be the "name" of the playlist, the original
@@ -178,14 +220,21 @@ struct _GstHLSVariantStream {
   gint width;
   gint height;
   gboolean iframe;
+  GstStreamType stream_type;
 
   gint refcount;       /* ATOMIC */
 
   GstM3U8 *m3u8;       /* media playlist */
 
+  gboolean assume_default;
+
   /* alternative renditions */
   gchar *media_groups[GST_HLS_N_MEDIA_TYPES];
   GList *media[GST_HLS_N_MEDIA_TYPES];
+
+  GstHLSAudioCodecPreference audio_codec_preference;
+  GstHLSVideoCodecPreference video_codec_preference;
+  gboolean check_preference;
 };
 
 GstHLSVariantStream * gst_hls_variant_stream_ref (GstHLSVariantStream * stream);
@@ -228,6 +277,10 @@ GstHLSVariantStream *  gst_hls_master_playlist_get_matching_variant (GstHLSMaste
                                                                      GstHLSVariantStream  * current_variant);
 
 void                   gst_hls_master_playlist_unref (GstHLSMasterPlaylist * playlist);
+guint                  gst_hls_master_playlist_get_initial_bitrate (GstHLSMasterPlaylist * playlist,
+                                                                  GstHLSVariantStream  * current_variant,
+                                                                  guint                  start_bitrate,
+                                                                  guint                  min_bitrate);
 
 G_END_DECLS
 

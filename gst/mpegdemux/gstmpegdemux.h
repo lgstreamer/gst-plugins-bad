@@ -66,6 +66,7 @@ typedef struct _GstPsDemuxClass GstPsDemuxClass;
 
 #define GST_PS_DEMUX_MAX_STREAMS	256
 #define GST_PS_DEMUX_MAX_PSM		256
+#define ABS_M(a) (((a) > 0) ? (a) : -(a))
 
 #define MAX_DVD_AUDIO_STREAMS       8
 #define MAX_DVD_SUBPICTURE_STREAMS  32
@@ -100,6 +101,18 @@ struct _GstPsStream
   gboolean need_segment;
 
   GstTagList *pending_tags;
+  /* DLNA_TrickPlay_Change  */
+  guint last_scan_offset;
+  gint last_seq_offset;
+  gboolean is_iframe;
+  gboolean is_iframe_in_cur_pes;
+  guint totalsize;
+  gboolean iframe_queuestart;
+  gboolean iframe_need_push;
+  GstAdapter *adapter;
+  guint64 pts;
+  guint64 dts;
+  guint iframeoffset;
 };
 
 struct _GstPsDemux
@@ -142,6 +155,15 @@ struct _GstPsDemux
   GstSegment sink_segment;
   GstSegment src_segment;
   gboolean adjust_segment;
+  gboolean adjusting_segment;
+
+  /* For Custom-player seek */
+  guint64 segment_position;
+  gboolean send_videosegment;
+  gboolean real_time;
+
+  /* For dlna */
+  guint64 dmx_duration;
 
   /* stream output */
   GstPsStream *current_stream;
@@ -156,6 +178,40 @@ struct _GstPsDemux
 
   /* Indicates an MPEG-2 stream */
   gboolean is_mpeg2_pack;
+
+  /* For DLNA properties */
+  guint32 dlna_opval;
+  guint32 dlna_flagval;
+  guint64 dlna_duration;
+  guint64 dlna_filelength;
+
+  gboolean thumbnail_mode;
+
+  /* DLNA_TrickPlay_Change  */
+  gdouble rate;
+  gboolean high_speed_trick;
+  guint64 seek_offset;
+  gboolean iframe_push_done;
+  gboolean ignore_flush;
+  guint64 buffer_size;
+  gboolean audio_push_done;
+  gboolean is_rate_changed;
+  guint64 first_seek_start;
+  guint64 current_seek_start;
+  guint64 trick_seek_offset;
+
+  gboolean is_keyframe;
+
+  guint32 pending_bytes;
+  guint64 packet_offset;
+  guint64 video_pes_offset;
+  guint64 keyframe_offset;
+  guint64 prev_keyframe_offset;
+  guint32 trick_seek_size;
+  guint32 iframe_interval;
+  gboolean need_more;
+  gboolean sf_range_request;
+
 };
 
 struct _GstPsDemuxClass

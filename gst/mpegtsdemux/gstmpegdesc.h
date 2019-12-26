@@ -1,4 +1,4 @@
-/* 
+/*
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -90,6 +90,18 @@
 #define DESC_ISO_639_LANGUAGE_language_code_nth(desc,i)		(&(desc[2 + (4*i)]))
 #define DESC_ISO_639_LANGUAGE_audio_type_nth(desc,i)		((desc)[5 + (4*i)])
 
+/* ISO_639_subtitle_language_descriptor */
+#define DESC_ISO_639_LANGUAGE_subtitle_n(desc)			((desc[1]) >> 3)
+#define DESC_ISO_639_LANGUAGE_subtitle_lang_code_nth(desc,i)	(&(desc[2 + (8*i)]))
+#define DESC_ISO_639_LANGUAGE_subtitle_type_nth(desc,i)		(desc[5 + (8*i)])
+#define DESC_ISO_639_LANGUAGE_composition_page_id_nth(desc,i)	(GST_READ_UINT16_BE(desc + 6 + (8*i)))
+#define DESC_ISO_639_LANGUAGE_ancillary_page_id_nth(desc,i)	(GST_READ_UINT16_BE(desc + 8 + (8*i)))
+
+/* DVB Teletext Descriptor */
+#define DESC_DVB_TELETEXT_teletext_type(desc,i)			(((desc)[3 + (5*i)] & 0xf8) >> 3)
+#define DESC_DVB_TELETEXT_teletext_magazine_number(desc,i) 	((desc)[3 + (5*i)] & 0x07)
+#define DESC_DVB_TELETEXT_teletext_page_number(desc,i) 		((desc)[4 + (5*i)])
+
 /* system_clock_descriptor */
 #define DESC_SYSTEM_CLOCK_external_clock_reference_indicator(desc) (((desc)[2] & 0x80) == 0x80)
 #define DESC_SYSTEM_CLOCK_clock_accuracy_integer(desc)		((desc)[2] & 0x3f)
@@ -147,6 +159,11 @@
 #define DESC_DVB_COMPONENT_type(desc)   (desc[3])
 #define DESC_DVB_COMPONENT_tag(desc)    (desc[4])
 #define DESC_DVB_COMPONENT_language(desc)   (desc + 5)
+
+/* DVB AC-3 or Enhanced AC-3 Descriptor */
+#define DESC_DVB_AC_COMPONENT_type_flag(desc) (((desc)[2] & 0x80) == 0x80)
+#define DESC_DVB_AC_COMPONENT_type(desc)      (desc[3])
+
 
 /* DVB Bouquet Name Descriptor */
 #define DESC_DVB_BOUQUET_NAME_text(desc)    (desc + 2)
@@ -209,8 +226,22 @@
 /* DVB Carousel Identifier Descriptor */
 #define DESC_DVB_CAROUSEL_IDENTIFIER_carousel_id(desc)		(GST_READ_UINT32_BE((desc) + 2))
 
+/* DVB Extension Descriptor */
+#define DESC_DVB_EXTENSION_tag_extension(desc)             ((desc)[2])
+
+/* DVB Supplementary audio descriptor */
+#define DESC_DVB_SUPPLEMENTARY_AUDIO_editorial_classification(desc) (((desc)[3] & 0x7c) >> 2)
+
 /* AC3_audio_stream_descriptor */
 #define DESC_AC_AUDIO_STREAM_bsid(desc)             ((desc)[2] & 0x1f)
+
+/* DOVI Video Stream Descriptor (Dolby HDR) */
+#define DESC_DOVI_VIDEO_STREAM_dv_profile(desc)             ((desc)[4] >> 1)
+#define DESC_DOVI_VIDEO_STREAM_dv_level(desc)               ((((desc)[4] & 0x01) << 5) | (((desc)[5] & 0xf8) >> 3))
+#define DESC_DOVI_VIDEO_STREAM_rpu_present_flag(desc)       (((desc)[5] & 0x04) >> 2)
+#define DESC_DOVI_VIDEO_STREAM_el_present_flag(desc)        (((desc)[5] & 0x02) >> 1)
+#define DESC_DOVI_VIDEO_STREAM_bl_present_flag(desc)        ((desc)[5] & 0x01)
+#define DESC_DOVI_VIDEO_STREAM_dependency_pid(desc)         (((desc)[6] << 5) | ((desc)[7] >> 3))
 
 /* FIXME : Move list of well know registration ids to an enum
  * in the mpegts library.
@@ -220,13 +251,15 @@
 
 /* registration_descriptor format IDs */
 #define DRF_ID_HDMV       0x48444d56
-#define DRF_ID_VC1        0x56432D31   /* defined in RP227 */
+#define DRF_ID_VC1        0x56432D31    /* defined in RP227 */
 #define DRF_ID_DTS1       0x44545331
 #define DRF_ID_DTS2       0x44545332
 #define DRF_ID_DTS3       0x44545333
+#define DRF_ID_DTSH       0x44545348
 #define DRF_ID_S302M      0x42535344
 #define DRF_ID_TSHV       0x54534856
 #define DRF_ID_AC3        0x41432d33
+#define DRF_ID_AC4        0x41432d34
 #define DRF_ID_GA94       0x47413934
 #define DRF_ID_CUEI       0x43554549
 #define DRF_ID_ETV1       0x45545631
@@ -234,5 +267,7 @@
 #define DRF_ID_KLVA       0x4b4c5641   /* defined in RP217 */
 #define DRF_ID_OPUS       0x4f707573
 #define DRF_ID_EAC3       0x45414333   /* defined in A/52 Annex G */
+#define DRF_ID_HDCP       0x48444350
+#define DRF_ID_DOVI       0x444F5649
 
 #endif /* __GST_MPEG_DESC_H__ */

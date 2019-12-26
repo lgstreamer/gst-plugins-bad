@@ -251,6 +251,7 @@ struct _MpegTSPacketizer2 {
   /* FIXME : be more memory efficient (see how it's done in mpegtsbase) */
   MpegTSPacketizerStream **streams;
   gboolean    disposed;
+  gboolean    know_packet_size;
   guint16     packet_size;
 
   /* current offset of the tip of the adapter */
@@ -262,6 +263,9 @@ struct _MpegTSPacketizer2 {
 
   /* offset/bitrate calculator */
   gboolean       calculate_offset;
+
+  /* conventional timestamp calculator*/
+  gboolean       calculate_only_ts;
 
   /* Shortcuts for adapter usage */
   guint8 *map_data;
@@ -367,6 +371,9 @@ mpegts_packetizer_pts_to_ts (MpegTSPacketizer2 * packetizer,
 G_GNUC_INTERNAL GstClockTime
 mpegts_packetizer_get_current_time (MpegTSPacketizer2 * packetizer,
 				    guint16 pcr_pid);
+G_GNUC_INTERNAL GstClockTime
+mpegts_packetizer_pts_to_rts (MpegTSPacketizer2 * packetizer,
+			     GstClockTime pts, guint16 pcr_pid);
 G_GNUC_INTERNAL void
 mpegts_packetizer_set_current_pcr_offset (MpegTSPacketizer2 * packetizer,
 			  GstClockTime offset, guint16 pcr_pid);
@@ -376,6 +383,9 @@ mpegts_packetizer_set_reference_offset (MpegTSPacketizer2 * packetizer,
 G_GNUC_INTERNAL void
 mpegts_packetizer_set_pcr_discont_threshold (MpegTSPacketizer2 * packetizer,
 					GstClockTime threshold);
+G_GNUC_INTERNAL GstClockTime
+mpegts_packetizer_calculate_ts (MpegTSPacketizer2 * packetizer,
+          GstClockTime cur_ts, GstClockTime * last_valid_ts, guint64 * ts_offset, guint8 * ts_wrap_count, guint16 pcr_pid);
 G_END_DECLS
 
 #endif /* GST_MPEGTS_PACKETIZER_H */

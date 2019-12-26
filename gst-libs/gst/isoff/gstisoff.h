@@ -59,6 +59,7 @@ gboolean gst_isoff_parse_box_header (GstByteReader * reader, guint32 * type, gui
 #define GST_ISOFF_FOURCC_MDHD GST_MAKE_FOURCC('m','d','h','d')
 #define GST_ISOFF_FOURCC_HDLR GST_MAKE_FOURCC('h','d','l','r')
 #define GST_ISOFF_FOURCC_SIDX GST_MAKE_FOURCC('s','i','d','x')
+#define GST_ISOFF_FOURCC_EMSG GST_MAKE_FOURCC('e','m','s','g')
 
 /* handler type */
 #define GST_ISOFF_FOURCC_SOUN GST_MAKE_FOURCC('s','o','u','n')
@@ -289,6 +290,27 @@ GstIsoffParserResult gst_isoff_sidx_parser_parse (GstSidxParser * parser, GstByt
 
 GST_ISOFF_API
 GstIsoffParserResult gst_isoff_sidx_parser_add_buffer (GstSidxParser * parser, GstBuffer * buf, guint * consumed);
+
+typedef struct _GstEmsgBox
+{
+  gchar *scheme_id_uri;
+  gchar *value;
+  guint32 timescale;
+  guint32 presentation_time_delta;
+  guint32 event_duration;
+  guint32 id;
+  guint8 *message_data;
+  guint message_data_size;
+} GstEmsgBox;
+
+GST_EXPORT
+GstEmsgBox * gst_isoff_emsg_box_parse (GstByteReader *reader);
+
+GST_EXPORT
+void gst_isoff_emsg_box_free (GstEmsgBox *emsg);
+
+GST_EXPORT
+GstClockTime gst_isoff_get_min_pts (GstMoovBox *moov, GstMoofBox *moof);
 
 G_END_DECLS
 

@@ -970,3 +970,93 @@ done:
   gst_buffer_unmap (buffer, &info);
   return res;
 }
+
+GstEmsgBox *
+gst_isoff_emsg_box_parse (GstByteReader * reader)
+{
+  GstEmsgBox *emsg;
+  const gchar *str;
+  const guint8 *data;
+
+  emsg = g_new0 (GstEmsgBox, 1);
+
+  if (!gst_byte_reader_get_string_utf8 (reader, &str))
+    goto error;
+  emsg->scheme_id_uri = g_strdup (str);
+
+  if (!gst_byte_reader_get_string_utf8 (reader, &str))
+    goto error;
+  emsg->value = g_strdup (str);
+
+  if (!gst_byte_reader_get_uint32_be (reader, &emsg->timescale) ||
+      !gst_byte_reader_get_uint32_be (reader, &emsg->presentation_time_delta) ||
+      !gst_byte_reader_get_uint32_be (reader, &emsg->event_duration) ||
+      !gst_byte_reader_get_uint32_be (reader, &emsg->id))
+    goto error;
+
+  emsg->message_data_size = gst_byte_reader_get_remaining (reader);
+
+  if (emsg->message_data_size > 0) {
+    if (!gst_byte_reader_get_data (reader, emsg->message_data_size, &data))
+      goto error;
+    emsg->message_data = g_malloc0 (sizeof (guint8) * emsg->message_data_size);
+    memcpy (emsg->message_data, data, emsg->message_data_size);
+  } else {
+    /* message_data may be empty */
+  }
+
+  return emsg;
+
+error:
+  gst_isoff_emsg_box_free (emsg);
+  return NULL;
+}
+
+void
+gst_isoff_emsg_box_free (GstEmsgBox * emsg)
+{
+  g_free (emsg->scheme_id_uri);
+  g_free (emsg->value);
+  g_free (emsg->message_data);
+  g_free (emsg);
+}
+
+GstClockTime
+gst_isoff_get_min_pts (GstMoovBox * moov, GstMoofBox * moof)
+{
+  GstClockTime min_pts = GST_CLOCK_TIME_NONE;
+  guint i, j;
+
+  g_return_val_if_fail (moov != NULL, GST_CLOCK_TIME_NONE);
+  g_return_val_if_fail (moof != NULL, GST_CLOCK_TIME_NONE);
+
+  for (i = 0; i < moov->trak->len; i++) {
+    GstTrakBox *trak = &g_array_index (moov->trak, GstTrakBox, i);
+    guint32 track_id;
+    guint32 timescale;
+
+    track_id = trak->tkhd.track_id;
+    timescale = trak->mdia.mdhd.timescale;
+    for (j = 0; j < moof->traf->len; j++) {
+      GstTrafBox *traf = &g_array_index (moof->traf, GstTrafBox, j);
+      GstClockTime timestamp;
+      guint64 decode_time;
+
+      if (traf->tfhd.track_id != track_id)
+        continue;
+
+      decode_time = traf->tfdt.decode_time;
+
+      /* no tfdt box, assume starting from zero */
+      if (decode_time == GST_CLOCK_TIME_NONE)
+        decode_time = 0;
+
+      timestamp = gst_util_uint64_scale (decode_time, GST_SECOND, timescale);
+
+      if (min_pts == GST_CLOCK_TIME_NONE || timestamp < min_pts)
+        min_pts = timestamp;
+    }
+  }
+
+  return min_pts;
+}

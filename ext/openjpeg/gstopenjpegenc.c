@@ -562,7 +562,7 @@ gst_openjpeg_enc_set_format (GstVideoEncoder * encoder,
   GstStructure *s;
   const gchar *colorspace = NULL;
   GstJPEG2000Sampling sampling = GST_JPEG2000_SAMPLING_NONE;
-  gint ncomps;
+  gint ncomps = 0;
 
   GST_DEBUG_OBJECT (self, "Setting format: %" GST_PTR_FORMAT, state->caps);
 

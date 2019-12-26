@@ -27,10 +27,6 @@
 #define GST_CAT_DEFAULT uridownloader_debug
 GST_DEBUG_CATEGORY (uridownloader_debug);
 
-#define GST_URI_DOWNLOADER_GET_PRIVATE(obj)  \
-   (G_TYPE_INSTANCE_GET_PRIVATE ((obj), \
-    GST_TYPE_URI_DOWNLOADER, GstUriDownloaderPrivate))
-
 struct _GstUriDownloaderPrivate
 {
   /* Fragments fetcher */
@@ -75,6 +71,7 @@ static GstStaticPadTemplate sinkpadtemplate = GST_STATIC_PAD_TEMPLATE ("sink",
 }
 
 G_DEFINE_TYPE_WITH_CODE (GstUriDownloader, gst_uri_downloader, GST_TYPE_OBJECT,
+    G_ADD_PRIVATE (GstUriDownloader)
     _do_init);
 
 static void
@@ -84,8 +81,6 @@ gst_uri_downloader_class_init (GstUriDownloaderClass * klass)
 
   gobject_class = (GObjectClass *) klass;
 
-  g_type_class_add_private (klass, sizeof (GstUriDownloaderPrivate));
-
   gobject_class->dispose = gst_uri_downloader_dispose;
   gobject_class->finalize = gst_uri_downloader_finalize;
 }
@@ -93,7 +88,7 @@ gst_uri_downloader_class_init (GstUriDownloaderClass * klass)
 static void
 gst_uri_downloader_init (GstUriDownloader * downloader)
 {
-  downloader->priv = GST_URI_DOWNLOADER_GET_PRIVATE (downloader);
+  downloader->priv = gst_uri_downloader_get_instance_private (downloader);
 
   /* Initialize the sink pad. This pad will be connected to the src pad of the
    * element created with gst_element_make_from_uri and will handle the download */
@@ -462,8 +457,8 @@ gst_uri_downloader_destroy_src (GstUriDownloader * downloader)
 
 static gboolean
 gst_uri_downloader_set_uri (GstUriDownloader * downloader, const gchar * uri,
-    const gchar * referer, gboolean compress,
-    gboolean refresh, gboolean allow_cache)
+    const gchar * referer, gchar * user_agent, gchar ** cookies,
+    gboolean compress, gboolean refresh, gboolean allow_cache)
 {
   GstPad *pad;
   GObjectClass *gobject_class;
@@ -478,7 +473,11 @@ gst_uri_downloader_set_uri (GstUriDownloader * downloader, const gchar * uri,
   if (g_object_class_find_property (gobject_class, "compress"))
     g_object_set (downloader->priv->urisrc, "compress", compress, NULL);
   if (g_object_class_find_property (gobject_class, "keep-alive"))
-    g_object_set (downloader->priv->urisrc, "keep-alive", TRUE, NULL);
+    g_object_set (downloader->priv->urisrc, "keep-alive", FALSE, NULL);
+  if (user_agent && g_object_class_find_property (gobject_class, "user-agent"))
+    g_object_set (downloader->priv->urisrc, "user-agent", user_agent, NULL);
+  if (cookies && g_object_class_find_property (gobject_class, "cookies"))
+    g_object_set (downloader->priv->urisrc, "cookies", cookies, NULL);
   if (g_object_class_find_property (gobject_class, "extra-headers")) {
     if (referer || refresh || !allow_cache) {
       GstStructure *extra_headers = gst_structure_new_empty ("headers");
@@ -535,12 +534,12 @@ gst_uri_downloader_set_method (GstUriDownloader * downloader,
 }
 
 GstFragment *
-gst_uri_downloader_fetch_uri (GstUriDownloader * downloader,
-    const gchar * uri, const gchar * referer, gboolean compress,
-    gboolean refresh, gboolean allow_cache, GError ** err)
+gst_uri_downloader_fetch_uri (GstUriDownloader * downloader, const gchar * uri,
+    const gchar * referer, gchar * user_agent, gchar ** cookies,
+    gboolean compress, gboolean refresh, gboolean allow_cache, GError ** err)
 {
   return gst_uri_downloader_fetch_uri_with_range (downloader, uri,
-      referer, compress, refresh, allow_cache, 0, -1, err);
+      referer, user_agent, cookies, compress, refresh, allow_cache, 0, -1, err);
 }
 
 /**
@@ -554,7 +553,8 @@ gst_uri_downloader_fetch_uri (GstUriDownloader * downloader,
  */
 GstFragment *
 gst_uri_downloader_fetch_uri_with_range (GstUriDownloader *
-    downloader, const gchar * uri, const gchar * referer, gboolean compress,
+    downloader, const gchar * uri, const gchar * referer,
+    gchar * user_agent, gchar ** cookies, gboolean compress,
     gboolean refresh, gboolean allow_cache,
     gint64 range_start, gint64 range_end, GError ** err)
 {
@@ -573,8 +573,8 @@ gst_uri_downloader_fetch_uri_with_range (GstUriDownloader *
     goto quit;
   }
 
-  if (!gst_uri_downloader_set_uri (downloader, uri, referer, compress, refresh,
-          allow_cache)) {
+  if (!gst_uri_downloader_set_uri (downloader, uri, referer, user_agent,
+          cookies, compress, refresh, allow_cache)) {
     GST_WARNING_OBJECT (downloader, "Failed to set URI");
     goto quit;
   }

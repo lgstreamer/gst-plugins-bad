@@ -177,7 +177,9 @@ typedef enum
   GST_H265_NAL_EOB              = 37,
   GST_H265_NAL_FD               = 38,
   GST_H265_NAL_PREFIX_SEI       = 39,
-  GST_H265_NAL_SUFFIX_SEI       = 40
+  GST_H265_NAL_SUFFIX_SEI       = 40,
+  GST_H265_NAL_DOLBY_HDR_META_DATA       = 62,
+  GST_H265_NAL_DOLBY_HDR_ENHANCED_LAYER       = 63,
 } GstH265NalUnitType;
 
 #define RESERVED_NON_IRAP_SUBLAYER_NAL_TYPE_MIN 10
@@ -227,7 +229,8 @@ typedef enum
 typedef enum
 {
   GST_H265_SEI_BUF_PERIOD = 0,
-  GST_H265_SEI_PIC_TIMING = 1
+  GST_H265_SEI_PIC_TIMING = 1,
+  GST_H265_SEI_USER_DATA = 5
       /* and more...  */
 } GstH265SEIPayloadType;
 
@@ -313,7 +316,10 @@ typedef struct _GstH265SliceHdr                 GstH265SliceHdr;
 
 typedef struct _GstH265PicTiming                GstH265PicTiming;
 typedef struct _GstH265BufferingPeriod          GstH265BufferingPeriod;
+typedef struct _GstH265UserData                 GstH265UserData;
 typedef struct _GstH265SEIMessage               GstH265SEIMessage;
+
+typedef struct _GstH265DvRPU                  GstH265DvRPU;
 
 /**
  * GstH265NalUnit:
@@ -607,8 +613,8 @@ struct _GstH265ShortTermRefPicSet
 
   /* calculated values */
   guint8 NumDeltaPocs;
-  guint8 NumNegativePics;
-  guint8 NumPositivePics;
+  guint32 NumNegativePics;
+  guint32 NumPositivePics;
   guint8 UsedByCurrPicS0[16];
   guint8 UsedByCurrPicS1[16];
   gint32 DeltaPocS0[16];
@@ -732,11 +738,12 @@ struct _GstH265VUIParams
   guint8 tiles_fixed_structure_flag;
   guint8 motion_vectors_over_pic_boundaries_flag;
   guint8 restricted_ref_pic_lists_flag;
-  guint16 min_spatial_segmentation_idc;
-  guint8 max_bytes_per_pic_denom;
-  guint8 max_bits_per_min_cu_denom;
-  guint8 log2_max_mv_length_horizontal;
-  guint8 log2_max_mv_length_vertical;
+
+  guint32 min_spatial_segmentation_idc;
+  guint32 max_bytes_per_pic_denom;
+  guint32 max_bits_per_min_cu_denom;
+  guint32 log2_max_mv_length_horizontal;
+  guint32 log2_max_mv_length_vertical;
 
   /* calculated values */
   guint par_n;
@@ -781,9 +788,14 @@ struct _GstH265SPS
   GstH265VPS *vps;
 
   guint8 max_sub_layers_minus1;
+  guint8 ext_or_max_sub_layers_minus1;
+  guint8 multi_layer_ext_sps_flag;
   guint8 temporal_id_nesting_flag;
 
   GstH265ProfileTierLevel profile_tier_level;
+
+  guint8 update_rep_format_flag;
+  guint8 rep_format_idx;
 
   guint8 chroma_format_idc;
   guint8 separate_colour_plane_flag;
@@ -814,6 +826,8 @@ struct _GstH265SPS
   guint8 max_transform_hierarchy_depth_intra;
 
   guint8 scaling_list_enabled_flag;
+  guint8 infer_scaling_list_flag;
+  guint8 scaling_list_ref_layer_id;
   /* if scaling_list_enabled_flag */
   guint8 scaling_list_data_present_flag;
 
@@ -1057,6 +1071,11 @@ struct _GstH265BufferingPeriod
   guint8 vcl_initial_alt_cpb_removal_offset[32];
 };
 
+struct _GstH265UserData
+{
+    gchar *payload_byte;
+};
+
 struct _GstH265SEIMessage
 {
   GstH265SEIPayloadType payloadType;
@@ -1064,8 +1083,19 @@ struct _GstH265SEIMessage
   union {
     GstH265BufferingPeriod buffering_period;
     GstH265PicTiming pic_timing;
+    GstH265UserData user_data;
     /* ... could implement more */
   } payload;
+};
+
+struct _GstH265DvRPU
+{
+  guint8 rpu_type;
+  guint16 rpu_format;
+  guint8 vdr_rpu_profile;
+  guint8 vdr_rpu_level;
+  guint8 vdr_seq_info_present_flag;
+  guint8 BL_video_full_range_flag;
 };
 
 /**
@@ -1156,6 +1186,11 @@ GST_CODEC_PARSERS_API
 GstH265ParserResult gst_h265_parse_pps              (GstH265Parser  * parser,
                                                      GstH265NalUnit * nalu,
                                                      GstH265PPS     * pps);
+
+GST_CODEC_PARSERS_API
+GstH265ParserResult gst_h265_parser_parse_dv_rpu      (GstH265Parser * parser,
+                                                       GstH265NalUnit * nalu,
+                                                       GstH265DvRPU * rpu);
 
 GST_CODEC_PARSERS_API
 gboolean            gst_h265_slice_hdr_copy (GstH265SliceHdr       * dst_slice,

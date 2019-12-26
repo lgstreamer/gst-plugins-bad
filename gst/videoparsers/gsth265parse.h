@@ -60,6 +60,7 @@ struct _GstH265Parse
   gboolean packetized;
   gboolean split_packetized;
   gboolean transform;
+  gboolean need_codec_data;
 
   /* state */
   GstH265Parser *nalparser;
@@ -99,6 +100,13 @@ struct _GstH265Parse
 
   GstClockTime pending_key_unit_ts;
   GstEvent *force_key_unit_event;
+
+  /* for dolby HDR */
+  gboolean is_dolby_hdr;
+  gboolean has_dolby_vision_field;
+
+  /* SEI: User Data */
+  gchar * user_data;
 };
 
 struct _GstH265ParseClass

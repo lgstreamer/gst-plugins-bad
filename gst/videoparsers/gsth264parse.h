@@ -50,6 +50,12 @@ GType gst_h264_parse_get_type (void);
 typedef struct _GstH264Parse GstH264Parse;
 typedef struct _GstH264ParseClass GstH264ParseClass;
 
+typedef enum
+{
+  APP_TYPE_DEFAULT = 0,
+  APP_TYPE_RTC
+} AppType;
+
 struct _GstH264Parse
 {
   GstBaseParse baseparse;
@@ -71,7 +77,6 @@ struct _GstH264Parse
   /* state */
   GstH264NalParser *nalparser;
   guint state;
-  guint in_align;
   guint align;
   guint format;
   gint current_off;
@@ -132,6 +137,16 @@ struct _GstH264Parse
   /* For insertion of AU Delimiter */
   gboolean aud_needed;
   gboolean aud_insert;
+
+  /* for dolby HDR */
+  gboolean is_dolby_hdr;
+  gboolean has_dolby_vision_field;
+
+  /* SEI: User Data */
+  gchar * user_data;
+
+  /* Smart property */
+  AppType app_type;
 };
 
 struct _GstH264ParseClass

@@ -30,6 +30,7 @@
 #include <gst/gst.h>
 #include <gst/base/gstbytereader.h>
 #include <gst/base/gstflowcombiner.h>
+#include <gst/base/gstbitreader.h>
 #include "mpegtsbase.h"
 #include "mpegtspacketizer.h"
 
@@ -64,6 +65,12 @@ G_BEGIN_DECLS
 typedef struct _GstTSDemux GstTSDemux;
 typedef struct _GstTSDemuxClass GstTSDemuxClass;
 
+typedef enum
+{
+  APP_TYPE_DEFAULT = 0,
+  APP_TYPE_RTC
+} AppType;
+
 struct _GstTSDemux
 {
   MpegTSBase parent;
@@ -77,11 +84,28 @@ struct _GstTSDemux
   guint program_number;
   gboolean emit_statistics;
 
+  /* property for PAD mode of HLSv4 */
+  guint srcpad_detect_mode;
+
+  /* property for thumbnail-mode */
+  gboolean thumbnail_mode;
+
+  /* property for app-type*/
+  AppType app_type;
+
+  /* property for Dolby-Vision */
+  gboolean dolby_vision_support;
+
   /*< private >*/
   gint program_generation; /* Incremented each time we switch program 0..15 */
   MpegTSBaseProgram *program;	/* Current program */
   MpegTSBaseProgram *previous_program; /* Previous program, to deactivate once
 					* the new program becomes active */
+
+  guint n_audio_streams;
+  guint n_video_streams;
+  guint n_private_streams;
+  guint n_subpicture_streams;
 
   /* segments to be sent */
   GstSegment segment;
@@ -101,6 +125,17 @@ struct _GstTSDemux
 
   /* Used when seeking for a keyframe to go backward in the stream */
   guint64 last_seek_offset;
+
+  /*for DLNA stalling*/
+  gboolean new_segment;
+
+  GstClockTime last_pts;
+  GstClockTime rollover_pts;
+  MpegTSBaseStream * rollover_stream;
+
+  /* property and members for hls */
+  gboolean adaptive_mode;
+  GstTagList *upstream_tags;
 };
 
 struct _GstTSDemuxClass

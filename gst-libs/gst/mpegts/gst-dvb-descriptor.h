@@ -151,6 +151,7 @@ typedef enum {
   GST_MTS_DESC_EXT_DVB_VIDEO_DEPTH_RANGE        = 0x10,
   GST_MTS_DESC_EXT_DVB_T2MI                     = 0x11,
   GST_MTS_DESC_EXT_DVB_URI_LINKAGE              = 0x13,
+  GST_MTS_DESC_EXT_DVB_AC4                      = 0x15,
 } GstMpegtsDVBExtendedDescriptorType;
 
 /* GST_MTS_DESC_DVB_CAROUSEL_IDENTIFIER (0x13) */
@@ -350,6 +351,10 @@ GST_MPEGTS_API
 GstMpegtsDescriptor *gst_mpegts_descriptor_from_dvb_service (GstMpegtsDVBServiceType service_type,
 							     const gchar * service_name,
 							     const gchar * service_provider);
+
+GST_EXPORT
+const GstMpegtsDescriptor *gst_mpegts_find_dvb_extension_descriptor (GPtrArray * descriptor,
+              guint8 tag, guint8 tag_extension);
 
 /* GST_MTS_DESC_DVB_SERVICE_LIST (0x41) */
 typedef struct _GstMpegtsDVBServiceListItem GstMpegtsDVBServiceListItem;

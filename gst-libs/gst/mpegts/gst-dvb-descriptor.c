@@ -528,6 +528,23 @@ beach:
   return descriptor;
 }
 
+const GstMpegtsDescriptor *
+gst_mpegts_find_dvb_extension_descriptor (GPtrArray * descriptor, guint8 tag,
+    guint8 tag_extension)
+{
+  guint i, nb_desc;
+
+  g_return_val_if_fail (descriptor != NULL, NULL);
+
+  nb_desc = descriptor->len;
+  for (i = 0; i < nb_desc; i++) {
+    GstMpegtsDescriptor *desc = g_ptr_array_index (descriptor, i);
+    if (desc->tag == tag && desc->tag_extension == tag_extension)
+      return (const GstMpegtsDescriptor *) desc;
+  }
+  return NULL;
+}
+
 /* GST_MTS_DESC_DVB_LINKAGE (0x4A) */
 static GstMpegtsDVBLinkageDescriptor *
 _gst_mpegts_dvb_linkage_descriptor_copy (GstMpegtsDVBLinkageDescriptor * source)

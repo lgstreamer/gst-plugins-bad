@@ -525,11 +525,11 @@ gst_h265_parse_vui_parameters (GstH265SPS * sps, NalReader * nr)
     READ_UINT8 (nr, vui->tiles_fixed_structure_flag, 1);
     READ_UINT8 (nr, vui->motion_vectors_over_pic_boundaries_flag, 1);
     READ_UINT8 (nr, vui->restricted_ref_pic_lists_flag, 1);
-    READ_UE_MAX (nr, vui->min_spatial_segmentation_idc, 4096);
-    READ_UE_MAX (nr, vui->max_bytes_per_pic_denom, 16);
-    READ_UE_MAX (nr, vui->max_bits_per_min_cu_denom, 16);
-    READ_UE_MAX (nr, vui->log2_max_mv_length_horizontal, 16);
-    READ_UE_MAX (nr, vui->log2_max_mv_length_vertical, 15);
+    READ_UE (nr, vui->min_spatial_segmentation_idc);
+    READ_UE (nr, vui->max_bytes_per_pic_denom);
+    READ_UE (nr, vui->max_bits_per_min_cu_denom);
+    READ_UE (nr, vui->log2_max_mv_length_horizontal);
+    READ_UE (nr, vui->log2_max_mv_length_vertical);
   }
 
   return TRUE;
@@ -795,13 +795,21 @@ gst_h265_parser_parse_short_term_ref_pic_sets (GstH265ShortTermRefPicSet *
 
   } else {
     /* 7-49 */
-    READ_UE_MAX (nr, stRPS->NumNegativePics,
-        sps->max_dec_pic_buffering_minus1[sps->max_sub_layers_minus1]);
+    if (!sps->multi_layer_ext_sps_flag) {
+      READ_UE_MAX (nr, stRPS->NumNegativePics,
+          sps->max_dec_pic_buffering_minus1[sps->max_sub_layers_minus1]);
+    } else {                    /* FIXME multi-layer */
+      READ_UE (nr, stRPS->NumNegativePics);
+    }
 
     /* 7-50 */
-    READ_UE_MAX (nr, stRPS->NumPositivePics,
-        (sps->max_dec_pic_buffering_minus1[sps->max_sub_layers_minus1] -
-            stRPS->NumNegativePics));
+    if (!sps->multi_layer_ext_sps_flag) {
+      READ_UE_MAX (nr, stRPS->NumPositivePics,
+          (sps->max_dec_pic_buffering_minus1[sps->max_sub_layers_minus1] -
+              stRPS->NumNegativePics));
+    } else {                    /* FIXME multi-layer */
+      READ_UE (nr, stRPS->NumPositivePics);
+    }
 
     for (i = 0; i < stRPS->NumNegativePics; i++) {
       READ_UE_MAX (nr, delta_poc_s0_minus1[i], 32767);
@@ -1097,6 +1105,60 @@ error:
   return GST_H265_PARSER_ERROR;
 }
 
+static gchar *
+convert_bytes_to_string (gconstpointer src_bytes)
+{
+  const guint8 *src = (const guint8 *) src_bytes;
+
+  return g_strdup_printf ("%02x%02x%02x%02x-%02x%02x-%02x%02x-"
+      "%02x%02x-%02x%02x%02x%02x%02x%02x",
+      src[0], src[1], src[2], src[3],
+      src[4], src[5], src[6], src[7],
+      src[8], src[9], src[10], src[11], src[12], src[13], src[14], src[15]);
+}
+
+static GstH265ParserResult
+gst_h265_parser_parse_user_data (GstH265Parser * parser,
+    GstH265UserData * data, NalReader * nr, guint payload_size)
+{
+  gchar *uuid;
+  gchar *payload;
+  guint8 tmp[30];
+  guint i;
+
+  GST_DEBUG ("parsing \"User Data\"");
+
+  // read uuid_iso_iec_11578: u(128)
+  for (i = 0; i < 16; i++) {
+    READ_UINT8 (nr, tmp[i], 8);
+  }
+  uuid = convert_bytes_to_string (tmp);
+  GST_DEBUG ("uuid: %s", uuid);
+  g_free (uuid);
+  payload_size -= 16;
+
+  // read user data
+  for (i = 0; i < payload_size; i++) {
+    READ_UINT8 (nr, tmp[i % 30], 8);
+  }
+  // Does it start with letters "LG;..."
+  if (tmp[0] == 76 && tmp[1] == 71 && tmp[2] == 59) {
+    payload = g_malloc0 (payload_size + 1);
+    for (i = 0; i < payload_size; i++) {
+      payload[i] = tmp[i];
+    }
+    data->payload_byte = g_strdup_printf ("%s", payload);
+    GST_DEBUG ("user-data: %s", data->payload_byte);
+    g_free (payload);
+  }
+
+  return GST_H265_PARSER_OK;
+
+error:
+  GST_WARNING ("error parsing \"User Data\"");
+  return GST_H265_PARSER_ERROR;
+}
+
 /******** API *************/
 
 /**
@@ -1236,10 +1298,7 @@ gst_h265_parser_identify_nalu (GstH265Parser * parser,
     return GST_H265_PARSER_NO_NAL_END;
   }
 
-  /* Mini performance improvement:
-   * We could have a way to store how many 0s were skipped to avoid
-   * parsing them again on the next NAL */
-  while (off2 > 0 && data[nalu->offset + off2 - 1] == 00)
+  if (off2 > 0 && data[nalu->offset + off2 - 1] == 00)
     off2--;
 
   nalu->size = off2;
@@ -1434,10 +1493,12 @@ gst_h265_parse_vps (GstH265NalUnit * nalu, GstH265VPS * vps)
   }
 
   READ_UINT8 (&nr, vps->max_layer_id, 6);
-  CHECK_ALLOWED_MAX (vps->max_layer_id, 0);
+  /* shall allow 63 */
+  CHECK_ALLOWED_MAX (vps->max_layer_id, 63);
 
   READ_UE_MAX (&nr, vps->num_layer_sets_minus1, 1023);
-  CHECK_ALLOWED_MAX (vps->num_layer_sets_minus1, 0);
+  /* allowd range is 0 to 1023 */
+  CHECK_ALLOWED_MAX (vps->num_layer_sets_minus1, 1023);
 
   for (i = 1; i <= vps->num_layer_sets_minus1; i++)
     for (j = 0; j <= vps->max_layer_id; j++)
@@ -1454,11 +1515,16 @@ gst_h265_parse_vps (GstH265NalUnit * nalu, GstH265VPS * vps)
       READ_UE_MAX (&nr, vps->num_ticks_poc_diff_one_minus1, G_MAXUINT32 - 1);
 
     READ_UE_MAX (&nr, vps->num_hrd_parameters, 1024);
-    CHECK_ALLOWED_MAX (vps->num_hrd_parameters, 1);
+    /* allowd range is
+     * 0 to vps_num_layer_sets_minus1 + 1 */
+    CHECK_ALLOWED_MAX (vps->num_hrd_parameters, vps->num_layer_sets_minus1 + 1);
 
     if (vps->num_hrd_parameters) {
       READ_UE_MAX (&nr, vps->hrd_layer_set_idx, 1023);
-      CHECK_ALLOWED_MAX (vps->hrd_layer_set_idx, 0);
+      /* allowd range is
+       * ( vps_base_layer_internal_flag ? 0 : 1 ) to vps_num_layer_sets_minus1
+       */
+      CHECK_ALLOWED_MAX (vps->hrd_layer_set_idx, vps->num_layer_sets_minus1);
 
       if (!gst_h265_parse_hrd_parameters (&vps->hrd_params, &nr,
               vps->cprms_present_flag, vps->max_sub_layers_minus1))
@@ -1498,7 +1564,9 @@ gst_h265_parser_parse_sps (GstH265Parser * parser, GstH265NalUnit * nalu,
     GST_DEBUG ("adding sequence parameter set with id: %d to array", sps->id);
 
     parser->sps[sps->id] = *sps;
-    parser->last_sps = &parser->sps[sps->id];
+    if (!nalu->layer_id) {
+      parser->last_sps = &parser->sps[sps->id];
+    }
   }
 
   return res;
@@ -1528,7 +1596,6 @@ gst_h265_parse_sps (GstH265Parser * parser, GstH265NalUnit * nalu,
   GstH265VUIParams *vui = NULL;
 
   INITIALIZE_DEBUG_CATEGORY;
-  GST_DEBUG ("parsing SPS");
 
   nal_reader_init (&nr, nalu->data + nalu->offset + nalu->header_bytes,
       nalu->size - nalu->header_bytes);
@@ -1543,52 +1610,74 @@ gst_h265_parse_sps (GstH265Parser * parser, GstH265NalUnit * nalu,
   }
   sps->vps = vps;
 
-  READ_UINT8 (&nr, sps->max_sub_layers_minus1, 3);
-  READ_UINT8 (&nr, sps->temporal_id_nesting_flag, 1);
+  if (!nalu->layer_id) {
+    READ_UINT8 (&nr, sps->max_sub_layers_minus1, 3);
+  } else {
+    READ_UINT8 (&nr, sps->ext_or_max_sub_layers_minus1, 3);
+  }
 
-  if (!gst_h265_parse_profile_tier_level (&sps->profile_tier_level, &nr,
-          sps->max_sub_layers_minus1))
-    goto error;
+  sps->multi_layer_ext_sps_flag = (nalu->layer_id != 0
+      && sps->ext_or_max_sub_layers_minus1 == 7);
+
+  if (!sps->multi_layer_ext_sps_flag) {
+    READ_UINT8 (&nr, sps->temporal_id_nesting_flag, 1);
+
+    if (!gst_h265_parse_profile_tier_level (&sps->profile_tier_level, &nr,
+            sps->max_sub_layers_minus1))
+      goto error;
+  }
 
   READ_UE_MAX (&nr, sps->id, GST_H265_MAX_SPS_COUNT - 1);
 
-  READ_UE_MAX (&nr, sps->chroma_format_idc, 3);
-  if (sps->chroma_format_idc == 3)
-    READ_UINT8 (&nr, sps->separate_colour_plane_flag, 1);
+  if (sps->multi_layer_ext_sps_flag) {
+    READ_UINT8 (&nr, sps->update_rep_format_flag, 1);
+    if (sps->update_rep_format_flag) {
+      READ_UINT8 (&nr, sps->rep_format_idx, 8);
+    }
+  } else {
+    READ_UE_MAX (&nr, sps->chroma_format_idc, 3);
+    if (sps->chroma_format_idc == 3)
+      READ_UINT8 (&nr, sps->separate_colour_plane_flag, 1);
 
-  READ_UE_ALLOWED (&nr, sps->pic_width_in_luma_samples, 1, 16888);
-  READ_UE_ALLOWED (&nr, sps->pic_height_in_luma_samples, 1, 16888);
+    READ_UE_ALLOWED (&nr, sps->pic_width_in_luma_samples, 1, 16888);
+    READ_UE_ALLOWED (&nr, sps->pic_height_in_luma_samples, 1, 16888);
 
-  READ_UINT8 (&nr, sps->conformance_window_flag, 1);
-  if (sps->conformance_window_flag) {
-    READ_UE (&nr, sps->conf_win_left_offset);
-    READ_UE (&nr, sps->conf_win_right_offset);
-    READ_UE (&nr, sps->conf_win_top_offset);
-    READ_UE (&nr, sps->conf_win_bottom_offset);
+    READ_UINT8 (&nr, sps->conformance_window_flag, 1);
+    if (sps->conformance_window_flag) {
+      READ_UE (&nr, sps->conf_win_left_offset);
+      READ_UE (&nr, sps->conf_win_right_offset);
+      READ_UE (&nr, sps->conf_win_top_offset);
+      READ_UE (&nr, sps->conf_win_bottom_offset);
+    }
+
+    READ_UE_MAX (&nr, sps->bit_depth_luma_minus8, 6);
+    READ_UE_MAX (&nr, sps->bit_depth_chroma_minus8, 6);
   }
 
-  READ_UE_MAX (&nr, sps->bit_depth_luma_minus8, 6);
-  READ_UE_MAX (&nr, sps->bit_depth_chroma_minus8, 6);
   READ_UE_MAX (&nr, sps->log2_max_pic_order_cnt_lsb_minus4, 12);
 
-  READ_UINT8 (&nr, sps->sub_layer_ordering_info_present_flag, 1);
-  for (i =
-      (sps->sub_layer_ordering_info_present_flag ? 0 :
-          sps->max_sub_layers_minus1); i <= sps->max_sub_layers_minus1; i++) {
-    READ_UE_MAX (&nr, sps->max_dec_pic_buffering_minus1[i], 16);
-    READ_UE_MAX (&nr, sps->max_num_reorder_pics[i],
-        sps->max_dec_pic_buffering_minus1[i]);
-    READ_UE_MAX (&nr, sps->max_latency_increase_plus1[i], G_MAXUINT32 - 1);
-  }
-  /* setting default values if sps->sub_layer_ordering_info_present_flag is zero */
-  if (!sps->sub_layer_ordering_info_present_flag && sps->max_sub_layers_minus1) {
-    for (i = 0; i <= (sps->max_sub_layers_minus1 - 1); i++) {
-      sps->max_dec_pic_buffering_minus1[i] =
-          sps->max_dec_pic_buffering_minus1[sps->max_sub_layers_minus1];
-      sps->max_num_reorder_pics[i] =
-          sps->max_num_reorder_pics[sps->max_sub_layers_minus1];
-      sps->max_latency_increase_plus1[i] =
-          sps->max_latency_increase_plus1[sps->max_sub_layers_minus1];
+  if (!sps->multi_layer_ext_sps_flag) {
+    READ_UINT8 (&nr, sps->sub_layer_ordering_info_present_flag, 1);
+    for (i =
+        (sps->sub_layer_ordering_info_present_flag ? 0 :
+            sps->max_sub_layers_minus1); i <= sps->max_sub_layers_minus1; i++) {
+      READ_UE_MAX (&nr, sps->max_dec_pic_buffering_minus1[i], 16);
+      READ_UE_MAX (&nr, sps->max_num_reorder_pics[i],
+          sps->max_dec_pic_buffering_minus1[i]);
+      READ_UE_MAX (&nr, sps->max_latency_increase_plus1[i], G_MAXUINT32 - 1);
+    }
+
+    /* setting default values if sps->sub_layer_ordering_info_present_flag is zero */
+    if (!sps->sub_layer_ordering_info_present_flag
+        && sps->max_sub_layers_minus1) {
+      for (i = 0; i <= (sps->max_sub_layers_minus1 - 1); i++) {
+        sps->max_dec_pic_buffering_minus1[i] =
+            sps->max_dec_pic_buffering_minus1[sps->max_sub_layers_minus1];
+        sps->max_num_reorder_pics[i] =
+            sps->max_num_reorder_pics[sps->max_sub_layers_minus1];
+        sps->max_latency_increase_plus1[i] =
+            sps->max_latency_increase_plus1[sps->max_sub_layers_minus1];
+      }
     }
   }
 
@@ -1602,12 +1691,21 @@ gst_h265_parse_sps (GstH265Parser * parser, GstH265NalUnit * nalu,
   READ_UE_MAX (&nr, sps->max_transform_hierarchy_depth_intra, 4);
 
   READ_UINT8 (&nr, sps->scaling_list_enabled_flag, 1);
-  if (sps->scaling_list_enabled_flag) {
-    READ_UINT8 (&nr, sps->scaling_list_data_present_flag, 1);
 
-    if (sps->scaling_list_data_present_flag)
-      if (!gst_h265_parser_parse_scaling_lists (&nr, &sps->scaling_list, FALSE))
-        goto error;
+  if (sps->scaling_list_enabled_flag) {
+    if (sps->multi_layer_ext_sps_flag)
+      READ_UINT8 (&nr, sps->infer_scaling_list_flag, 1);
+
+    if (sps->infer_scaling_list_flag) {
+      READ_UINT8 (&nr, sps->scaling_list_ref_layer_id, 6);
+    } else {
+      READ_UINT8 (&nr, sps->scaling_list_data_present_flag, 1);
+
+      if (sps->scaling_list_data_present_flag)
+        if (!gst_h265_parser_parse_scaling_lists (&nr, &sps->scaling_list,
+                FALSE))
+          goto error;
+    }
   }
 
   READ_UINT8 (&nr, sps->amp_enabled_flag, 1);
@@ -1623,10 +1721,11 @@ gst_h265_parse_sps (GstH265Parser * parser, GstH265NalUnit * nalu,
   }
 
   READ_UE_MAX (&nr, sps->num_short_term_ref_pic_sets, 64);
-  for (i = 0; i < sps->num_short_term_ref_pic_sets; i++)
+  for (i = 0; i < sps->num_short_term_ref_pic_sets; i++) {
     if (!gst_h265_parser_parse_short_term_ref_pic_sets
         (&sps->short_term_ref_pic_set[i], &nr, i, sps))
       goto error;
+  }
 
   READ_UINT8 (&nr, sps->long_term_ref_pics_present_flag, 1);
   if (sps->long_term_ref_pics_present_flag) {
@@ -1657,6 +1756,7 @@ gst_h265_parse_sps (GstH265Parser * parser, GstH265NalUnit * nalu,
   /* Calculate  width and height */
   sps->width = sps->pic_width_in_luma_samples;
   sps->height = sps->pic_height_in_luma_samples;
+
   if (sps->width < 0 || sps->height < 0) {
     GST_WARNING ("invalid width/height in SPS");
     goto error;
@@ -2241,6 +2341,11 @@ gst_h265_parser_parse_sei_message (GstH265Parser * parser,
         res = gst_h265_parser_parse_pic_timing (parser,
             &sei->payload.pic_timing, nr);
         break;
+      case GST_H265_SEI_USER_DATA:
+        /* size not set; might depend on emulation_prevention_three_byte */
+        res = gst_h265_parser_parse_user_data (parser,
+            &sei->payload.user_data, nr, payload_size / 8);
+        break;
       default:
         /* Just consume payloadSize bytes, which does not account for
            emulation prevention bytes */
@@ -2286,6 +2391,84 @@ gst_h265_parser_parse_sei_message (GstH265Parser * parser,
 
 error:
   GST_WARNING ("error parsing \"Sei message\"");
+  return GST_H265_PARSER_ERROR;
+}
+
+/**
+ * gst_h265_parser_parse_dv_rpu:
+ * Author: Seungha Yang <sh.yang@lge.com>
+ * @parser: a #GstH265Parser
+ * @nalu: The #GST_H265_NAL_DOLBY_HDR_META_DATA #GstH265NalUnit to parse
+ * @rpu: The #GstH265DvRPU to fill.
+ *
+ * Parses @data, and fills the @rpu structure.
+ *
+ * Returns: a #GstH265ParserResult
+ */
+GstH265ParserResult
+gst_h265_parser_parse_dv_rpu (GstH265Parser * parser,
+    GstH265NalUnit * nalu, GstH265DvRPU * rpu)
+{
+  NalReader nr;
+  guint8 tmp;
+  guint8 chroma_resampling_explicit_filter_flag;
+  guint8 coefficient_data_type;
+
+  if (!nalu->size) {
+    GST_DEBUG ("Invalid Nal Unit");
+    return GST_H265_PARSER_ERROR;
+  }
+
+  nal_reader_init (&nr, nalu->data + nalu->offset + 2, nalu->size - 2);
+
+  GST_DEBUG ("parsing Dolby Vision rpu");
+
+  /* Set default values fo fields */
+  rpu->rpu_type = 2;
+  rpu->rpu_format = 0;
+  rpu->vdr_rpu_profile = 0;
+  rpu->vdr_rpu_level = 0;
+  rpu->vdr_seq_info_present_flag = 0;
+  rpu->BL_video_full_range_flag = 0;
+
+  /* Skip forbidden_zero_bit & nal_ref_idc */
+  nal_reader_skip (&nr, 3);
+  READ_UINT8 (&nr, tmp, 5);
+  if (tmp != 0x19) {
+    GST_DEBUG ("nal type is not rpu_data_rbsp");
+    return GST_H265_PARSER_ERROR;
+  }
+
+  READ_UINT8 (&nr, rpu->rpu_type, 6);
+  READ_UINT16 (&nr, rpu->rpu_format, 11);
+
+  if (rpu->rpu_type == 2) {
+    READ_UINT8 (&nr, rpu->vdr_rpu_profile, 4);
+    READ_UINT8 (&nr, rpu->vdr_rpu_level, 4);
+    READ_UINT8 (&nr, rpu->vdr_seq_info_present_flag, 1);
+    if (rpu->vdr_seq_info_present_flag) {
+#if 0
+      /* FIXME: dolby vision main profile does not match below condition */
+      if (EL_chroma_format_idc == 2 && BL_chroma_format_idc == 0)
+        READ_UE_ALLOWED (&nr, tmp, 0, 3);       // chroma_sample_loc_type
+#endif
+      READ_UINT8 (&nr, chroma_resampling_explicit_filter_flag, 1);
+      READ_UINT8 (&nr, coefficient_data_type, 2);
+      if (coefficient_data_type == 0) {
+        READ_UE_ALLOWED (&nr, tmp, 0, 32);      // coefficient_log2_denom
+        if (chroma_resampling_explicit_filter_flag)
+          READ_UE_ALLOWED (&nr, tmp, 0, 14);    // chroma_filter_exp_coef_log2_denom_minus6
+      }
+      READ_UINT8 (&nr, tmp, 2); // vdr_rpu_normalized_idc
+      READ_UINT8 (&nr, rpu->BL_video_full_range_flag, 1);
+    }
+  } else
+    GST_DEBUG ("rpu_type %d is not 2", rpu->rpu_type);
+
+  return GST_H265_PARSER_OK;
+
+error:
+  GST_WARNING ("error parsing Dolby Vision rpu");
   return GST_H265_PARSER_ERROR;
 }
 

@@ -112,6 +112,8 @@ struct _GstDashDemuxStream
   GstClockTime target_time;
   /* Average skip-ahead time (only in trickmode-key-units) */
   GstClockTime average_skip_size;
+
+  GList *inband_event_stream; /* list of InbandEventStream */
 };
 
 /**
@@ -157,4 +159,3 @@ GType gst_dash_demux_get_type (void);
 
 G_END_DECLS
 #endif /* __GST_DASH_DEMUX_H__ */
-

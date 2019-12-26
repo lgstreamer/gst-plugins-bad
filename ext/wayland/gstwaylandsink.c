@@ -371,6 +371,13 @@ gst_wayland_sink_change_state (GstElement * element, GstStateChange transition)
         } else {
           /* remove buffer from surface, show nothing */
           gst_wl_window_render (sink->window, NULL, NULL);
+
+          /* FIXME: This is a temporary patch for avoid crash.
+           * wait until wayland surface frame callback is come
+           */
+          while (sink->redraw_pending != FALSE) {
+            wl_display_roundtrip_queue (sink->display->display, sink->display->queue);
+          }
         }
       }
       break;
@@ -965,14 +972,13 @@ gst_wayland_sink_begin_geometry_change (GstWaylandVideo * video)
   g_return_if_fail (sink != NULL);
 
   g_mutex_lock (&sink->render_lock);
-  if (!sink->window || !sink->window->area_subsurface) {
+  if (!sink->window) {
     g_mutex_unlock (&sink->render_lock);
     GST_INFO_OBJECT (sink,
         "begin_geometry_change called without window, ignoring");
     return;
   }
 
-  wl_subsurface_set_sync (sink->window->area_subsurface);
   g_mutex_unlock (&sink->render_lock);
 }
 
@@ -983,14 +989,13 @@ gst_wayland_sink_end_geometry_change (GstWaylandVideo * video)
   g_return_if_fail (sink != NULL);
 
   g_mutex_lock (&sink->render_lock);
-  if (!sink->window || !sink->window->area_subsurface) {
+  if (!sink->window) {
     g_mutex_unlock (&sink->render_lock);
     GST_INFO_OBJECT (sink,
         "end_geometry_change called without window, ignoring");
     return;
   }
 
-  wl_subsurface_set_desync (sink->window->area_subsurface);
   g_mutex_unlock (&sink->render_lock);
 }
 

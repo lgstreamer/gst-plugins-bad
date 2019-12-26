@@ -1115,6 +1115,60 @@ error:
   return GST_H264_PARSER_ERROR;
 }
 
+static gchar *
+convert_bytes_to_string (gconstpointer src_bytes)
+{
+  const guint8 *src = (const guint8 *) src_bytes;
+
+  return g_strdup_printf ("%02x%02x%02x%02x-%02x%02x-%02x%02x-"
+      "%02x%02x-%02x%02x%02x%02x%02x%02x",
+      src[0], src[1], src[2], src[3],
+      src[4], src[5], src[6], src[7],
+      src[8], src[9], src[10], src[11], src[12], src[13], src[14], src[15]);
+}
+
+static GstH264ParserResult
+gst_h264_parser_parse_user_data (GstH264NalParser * nalparser,
+    GstH264UserData * data, NalReader * nr, guint payload_size)
+{
+  gchar *uuid;
+  gchar *payload;
+  guint8 tmp[30];
+  guint i;
+
+  GST_DEBUG ("parsing \"User Data\"");
+
+  // read uuid_iso_iec_11578: u(128)
+  for (i = 0; i < 16; i++) {
+    READ_UINT8 (nr, tmp[i], 8);
+  }
+  uuid = convert_bytes_to_string (tmp);
+  GST_DEBUG ("uuid: %s", uuid);
+  g_free (uuid);
+  payload_size -= 16;
+
+  // read user data
+  for (i = 0; i < payload_size; i++) {
+    READ_UINT8 (nr, tmp[i % 30], 8);
+  }
+  // Does it start with letters "LG;..."
+  if (tmp[0] == 76 && tmp[1] == 71 && tmp[2] == 59) {
+    payload = g_malloc0 (payload_size + 1);
+    for (i = 0; i < payload_size; i++) {
+      payload[i] = tmp[i];
+    }
+    data->payload_byte = g_strdup_printf ("%s", payload);
+    GST_DEBUG ("user-data: %s", data->payload_byte);
+    g_free (payload);
+  }
+
+  return GST_H264_PARSER_OK;
+
+error:
+  GST_WARNING ("error parsing \"User Data\"");
+  return GST_H264_PARSER_ERROR;
+}
+
 static GstH264ParserResult
 gst_h264_parser_parse_sei_message (GstH264NalParser * nalparser,
     NalReader * nr, GstH264SEIMessage * sei)
@@ -1156,6 +1210,11 @@ gst_h264_parser_parse_sei_message (GstH264NalParser * nalparser,
       /* size not set; might depend on emulation_prevention_three_byte */
       res = gst_h264_parser_parse_pic_timing (nalparser,
           &sei->payload.pic_timing, nr);
+      break;
+    case GST_H264_SEI_USER_DATA:
+      /* size not set; might depend on emulation_prevention_three_byte */
+      res = gst_h264_parser_parse_user_data (nalparser,
+          &sei->payload.user_data, nr, payload_size / 8);
       break;
     case GST_H264_SEI_RECOVERY_POINT:
       res = gst_h264_parser_parse_recovery_point (nalparser,
@@ -1348,6 +1407,10 @@ gst_h264_parser_identify_nalu (GstH264NalParser * nalparser,
 
   off2 = scan_for_start_codes (data + nalu->offset, size - nalu->offset);
   if (off2 < 0) {
+    if (nalu->type == GST_H264_NAL_SEQ_END ||
+        nalu->type == GST_H264_NAL_STREAM_END)
+      return GST_H264_PARSER_OK;
+
     GST_DEBUG ("Nal start %d, No end found", nalu->offset);
 
     return GST_H264_PARSER_NO_NAL_END;
@@ -1360,7 +1423,7 @@ gst_h264_parser_identify_nalu (GstH264NalParser * nalparser,
     off2--;
 
   nalu->size = off2;
-  if (nalu->size < 2)
+  if (nalu->size < 1)
     return GST_H264_PARSER_BROKEN_DATA;
 
   GST_DEBUG ("Complete nal found. Off: %d, Size: %d", nalu->offset, nalu->size);
@@ -2306,7 +2369,85 @@ gst_h264_parser_parse_sei (GstH264NalParser * nalparser, GstH264NalUnit * nalu,
 }
 
 /**
- * gst_h264_quant_matrix_8x8_get_zigzag_from_raster:
+ * gst_h264_parser_parse_dv_rpu:
+ * Author: Seungha Yang <sh.yang@lge.com>
+ * @nalparser: a #GstH264NalParser
+ * @nalu: The #GST_H264_NAL_DOLBY_HDR_META_DATA #GstH264NalUnit to parse
+ * @rpu: The #GstH264DvRPU to fill.
+ *
+ * Parses @data, and fills the @rpu structure.
+ *
+ * Returns: a #GstH264ParserResult
+ */
+GstH264ParserResult
+gst_h264_parser_parse_dv_rpu (GstH264NalParser * parser,
+    GstH264NalUnit * nalu, GstH264DvRPU * rpu)
+{
+  NalReader nr;
+  guint8 tmp;
+  guint8 chroma_resampling_explicit_filter_flag;
+  guint8 coefficient_data_type;
+
+  if (!nalu->size) {
+    GST_DEBUG ("Invalid Nal Unit");
+    return GST_H264_PARSER_ERROR;
+  }
+
+  nal_reader_init (&nr, nalu->data + nalu->offset + 2, nalu->size - 2);
+
+  GST_DEBUG ("parsing Dolby Vision rpu");
+
+  /* Set default values fo fields */
+  rpu->rpu_type = 2;
+  rpu->rpu_format = 0;
+  rpu->vdr_rpu_profile = 0;
+  rpu->vdr_rpu_level = 0;
+  rpu->vdr_seq_info_present_flag = 0;
+  rpu->BL_video_full_range_flag = 0;
+
+  /* Skip forbidden_zero_bit & nal_ref_idc */
+  nal_reader_skip (&nr, 3);
+  READ_UINT8 (&nr, tmp, 5);
+  if (tmp != 0x19) {
+    GST_DEBUG ("nal type is not rpu_data_rbsp");
+    return GST_H264_PARSER_ERROR;
+  }
+
+  READ_UINT8 (&nr, rpu->rpu_type, 6);
+  READ_UINT16 (&nr, rpu->rpu_format, 11);
+
+  if (rpu->rpu_type == 2) {
+    READ_UINT8 (&nr, rpu->vdr_rpu_profile, 4);
+    READ_UINT8 (&nr, rpu->vdr_rpu_level, 4);
+    READ_UINT8 (&nr, rpu->vdr_seq_info_present_flag, 1);
+    if (rpu->vdr_seq_info_present_flag) {
+#if 0
+      /* FIXME: dolby vision main profile does not match below condition */
+      if (EL_chroma_format_idc == 2 && BL_chroma_format_idc == 0)
+        READ_UE_ALLOWED (&nr, tmp, 0, 3);       // chroma_sample_loc_type
+#endif
+      READ_UINT8 (&nr, chroma_resampling_explicit_filter_flag, 1);
+      READ_UINT8 (&nr, coefficient_data_type, 2);
+      if (coefficient_data_type == 0) {
+        READ_UE_ALLOWED (&nr, tmp, 0, 32);      // coefficient_log2_denom
+        if (chroma_resampling_explicit_filter_flag)
+          READ_UE_ALLOWED (&nr, tmp, 0, 14);    // chroma_filter_exp_coef_log2_denom_minus6
+      }
+      READ_UINT8 (&nr, tmp, 2); // vdr_rpu_normalized_idc
+      READ_UINT8 (&nr, rpu->BL_video_full_range_flag, 1);
+    }
+  } else
+    GST_DEBUG ("rpu_type %d is not 2", rpu->rpu_type);
+
+  return GST_H264_PARSER_OK;
+
+error:
+  GST_WARNING ("error parsing Dolby Vision rpu");
+  return GST_H264_PARSER_ERROR;
+}
+
+/**
+ * gst_h264_video_quant_matrix_8x8_get_zigzag_from_raster:
  * @out_quant: (out): The resulting quantization matrix
  * @quant: The source quantization matrix
  *

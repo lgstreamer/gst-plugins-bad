@@ -157,7 +157,9 @@ typedef enum
   GST_H264_NAL_DEPTH_SPS    = 16,
   GST_H264_NAL_SLICE_AUX    = 19,
   GST_H264_NAL_SLICE_EXT    = 20,
-  GST_H264_NAL_SLICE_DEPTH  = 21
+  GST_H264_NAL_SLICE_DEPTH  = 21,
+  GST_H264_NAL_DOLBY_HDR_META_DATA      = 28,
+  GST_H264_NAL_DOLBY_HDR_ENHANCED_LAYER = 30
 } GstH264NalUnitType;
 
 /**
@@ -249,6 +251,7 @@ typedef enum
 {
   GST_H264_SEI_BUF_PERIOD = 0,
   GST_H264_SEI_PIC_TIMING = 1,
+  GST_H264_SEI_USER_DATA = 5,
   GST_H264_SEI_RECOVERY_POINT = 6,
   GST_H264_SEI_STEREO_VIDEO_INFO = 21,
   GST_H264_SEI_FRAME_PACKING = 45
@@ -327,11 +330,14 @@ typedef struct _GstH264SliceHdr               GstH264SliceHdr;
 
 typedef struct _GstH264ClockTimestamp         GstH264ClockTimestamp;
 typedef struct _GstH264PicTiming              GstH264PicTiming;
+typedef struct _GstH264UserData               GstH264UserData;
 typedef struct _GstH264BufferingPeriod        GstH264BufferingPeriod;
 typedef struct _GstH264RecoveryPoint          GstH264RecoveryPoint;
 typedef struct _GstH264StereoVideoInfo        GstH264StereoVideoInfo;
 typedef struct _GstH264FramePacking           GstH264FramePacking;
 typedef struct _GstH264SEIMessage             GstH264SEIMessage;
+
+typedef struct _GstH264DvRPU                  GstH264DvRPU;
 
 /**
  * GstH264NalUnitExtensionMVC:
@@ -997,6 +1003,12 @@ struct _GstH264RecoveryPoint
   guint8 changing_slice_group_idc;
 };
 
+struct _GstH264UserData
+{
+  gchar *payload_byte;
+};
+
+
 struct _GstH264SEIMessage
 {
   GstH264SEIPayloadType payloadType;
@@ -1004,11 +1016,22 @@ struct _GstH264SEIMessage
   union {
     GstH264BufferingPeriod buffering_period;
     GstH264PicTiming pic_timing;
+    GstH264UserData user_data;
     GstH264RecoveryPoint recovery_point;
     GstH264StereoVideoInfo stereo_video_info;
     GstH264FramePacking frame_packing;
     /* ... could implement more */
   } payload;
+};
+
+struct _GstH264DvRPU
+{
+  guint8 rpu_type;
+  guint16 rpu_format;
+  guint8 vdr_rpu_profile;
+  guint8 vdr_rpu_level;
+  guint8 vdr_seq_info_present_flag;
+  guint8 BL_video_full_range_flag;
 };
 
 /**
@@ -1088,6 +1111,11 @@ void                gst_h264_sps_clear                (GstH264SPS *sps);
 
 GST_CODEC_PARSERS_API
 void                gst_h264_pps_clear                (GstH264PPS *pps);
+
+GST_CODEC_PARSERS_API
+GstH264ParserResult gst_h264_parser_parse_dv_rpu      (GstH264NalParser * parser,
+                                                       GstH264NalUnit * nalu,
+                                                       GstH264DvRPU * rpu);
 
 GST_CODEC_PARSERS_API
 void    gst_h264_quant_matrix_8x8_get_zigzag_from_raster (guint8 out_quant[64],

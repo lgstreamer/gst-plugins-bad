@@ -68,10 +68,16 @@ GST_URI_DOWNLOADER_API
 void gst_uri_downloader_set_parent (GstUriDownloader * downloader, GstElement * parent);
 
 GST_URI_DOWNLOADER_API
-GstFragment * gst_uri_downloader_fetch_uri (GstUriDownloader * downloader, const gchar * uri, const gchar * referer, gboolean compress, gboolean refresh, gboolean allow_cache, GError ** err);
+GstFragment *gst_uri_downloader_fetch_uri (GstUriDownloader * downloader,
+    const gchar * uri, const gchar * referer, gchar * user_agent,
+    gchar ** cookies, gboolean compress, gboolean refresh, gboolean allow_cache,
+    GError ** err);
 
 GST_URI_DOWNLOADER_API
-GstFragment * gst_uri_downloader_fetch_uri_with_range (GstUriDownloader * downloader, const gchar * uri, const gchar * referer, gboolean compress, gboolean refresh, gboolean allow_cache, gint64 range_start, gint64 range_end, GError ** err);
+GstFragment *gst_uri_downloader_fetch_uri_with_range (GstUriDownloader *
+    downloader, const gchar * uri, const gchar * referer, gchar * user_agent,
+    gchar ** cookies, gboolean compress, gboolean refresh, gboolean allow_cache,
+    gint64 range_start, gint64 range_end, GError ** err);
 
 GST_URI_DOWNLOADER_API
 void gst_uri_downloader_reset (GstUriDownloader *downloader);

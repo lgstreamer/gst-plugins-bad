@@ -457,6 +457,7 @@ AG_GST_CHECK_PLUGIN(frei0r)
 AG_GST_CHECK_PLUGIN(gaudieffects)
 AG_GST_CHECK_PLUGIN(geometrictransform)
 AG_GST_CHECK_PLUGIN(gdp)
+AG_GST_CHECK_PLUGIN(h265combiner)
 AG_GST_CHECK_PLUGIN(id3tag)
 AG_GST_CHECK_PLUGIN(inter)
 AG_GST_CHECK_PLUGIN(interlace)
@@ -470,6 +471,7 @@ AG_GST_CHECK_PLUGIN(mpegdemux)
 AG_GST_CHECK_PLUGIN(mpegtsdemux)
 AG_GST_CHECK_PLUGIN(mpegtsmux)
 AG_GST_CHECK_PLUGIN(mpegpsmux)
+AG_GST_CHECK_PLUGIN(multiapp)
 AG_GST_CHECK_PLUGIN(mxf)
 AG_GST_CHECK_PLUGIN(netsim)
 AG_GST_CHECK_PLUGIN(onvif)
@@ -1201,6 +1203,15 @@ AG_GST_CHECK_FEATURE(CHROMAPRINT, [chromaprint], chromaprint, [
 ])
 
 dnl *** Curl ***
+AC_ARG_ENABLE([libssh2],
+     [  --enable-libssh2		enable LIBSSH2 support @<:@default=auto@:>@],
+     [case "${enableval}" in
+       yes)  NEED_SSH2=yes ;;
+       no)   NEED_SSH2=no ;;
+       auto) NEED_SSH2=auto ;;
+       *) AC_MSG_ERROR([bad value ${enableval} for --enable-libssh2]) ;;
+     esac],[NEED_SSH2=auto])
+
 translit(dnm, m, l) AM_CONDITIONAL(USE_CURL, true)
 AG_GST_CHECK_FEATURE(CURL, [Curl plugin], curl, [
   PKG_CHECK_MODULES(CURL, libcurl >= 7.35.0, [
@@ -1223,16 +1234,26 @@ AG_GST_CHECK_FEATURE(CURL, [Curl plugin], curl, [
   ])
   AC_SUBST(CURL_CFLAGS)
   AC_SUBST(CURL_LIBS)
-  PKG_CHECK_MODULES(SSH2, libssh2 >= 1.4.3, [
-    HAVE_SSH2="yes"
-    AC_DEFINE(HAVE_SSH2, 1, [Define if libssh2 is available])
-  ], [
-    HAVE_SSH2="no"
-  ])
+  if test "x$NEED_SSH2" != "xno"; then
+    PKG_CHECK_MODULES(SSH2, libssh2 >= 1.4.3, [
+      HAVE_SSH2="yes"
+      AC_DEFINE(HAVE_SSH2, 1, [Define if libssh2 is available])
+    ], [
+      HAVE_SSH2="no"
+    ])
+  fi
   AM_CONDITIONAL(USE_SSH2, test "x$HAVE_SSH2" = "xyes")
   AC_SUBST(SSH2_CFLAGS)
   AC_SUBST(SSH2_LIBS)
 ],,,[AM_CONDITIONAL(USE_SSH2, false)])
+
+dnl *** basedrm ***
+translit(dnm, m, l) AM_CONDITIONAL(USE_SOUP, true)
+AG_GST_CHECK_FEATURE(SOUP, [basedrm library], basedrm, [
+  PKG_CHECK_MODULES(SOUP, libsoup-2.4 >= 2.40 libxml-2.0 >= 2.7, [HAVE_SOUP="yes"], [HAVE_SOUP="no"])
+  AC_SUBST(SOUP_CFLAGS)
+  AC_SUBST(SOUP_LIBS)
+])
 
 dnl **** DASH ****
 translit(dnm, m, l) AM_CONDITIONAL(USE_DASH, true)
@@ -1319,7 +1340,7 @@ dnl **** Wayland ****
 translit(dnm, m, l) AM_CONDITIONAL(USE_WAYLAND, true)
 AC_PATH_PROG([wayland_scanner], [wayland-scanner])
 AG_GST_CHECK_FEATURE(WAYLAND, [wayland sink], wayland , [
-  PKG_CHECK_MODULES(WAYLAND, wayland-client >= 1.4.0 libdrm >= 2.4.55 wayland-protocols >= 1.4, [
+  PKG_CHECK_MODULES(WAYLAND, wayland-client >= 1.11.0 wayland-protocols >= 1.4, [
     if test "x$wayland_scanner" != "x"; then
       HAVE_WAYLAND="yes"
       AC_SUBST(WAYLAND_PROTOCOLS_DATADIR, `$PKG_CONFIG --variable=pkgdatadir wayland-protocols`)
@@ -1587,6 +1608,18 @@ AG_GST_CHECK_FEATURE(TTML, [TTML plugin], ttml, [
     HAVE_TTML="yes"
   ], [
     HAVE_TTML="no"
+  ])
+])
+
+dnl *** ckdrm ***
+translit(dnm, m, l) AM_CONDITIONAL(USE_CKDRM, true)
+AG_GST_CHECK_FEATURE(CKDRM, [CKDRM plugin], ckdrm, [
+  PKG_CHECK_MODULES(CKDRM, [ openssl >= 1.0.1  libcrypto ], [
+    HAVE_CKDRM="yes"
+    AC_SUBST(CKDRM_CFLAGS)
+    AC_SUBST(CKDRM_LIBS)
+  ], [
+    HAVE_CKDRM="no"
   ])
 ])
 
@@ -2310,6 +2343,14 @@ AG_GST_CHECK_FEATURE(WEBRTC, [WebRTC], webrtc, [
   ])
 ])
 
+dnl *** json-c ***
+translit(dnm, m, l) AM_CONDITIONAL(USE_JSONC, true)
+AG_GST_CHECK_FEATURE(JSONC, [json-c], json-c, [
+  PKG_CHECK_MODULES(JSONC, json-c, HAVE_JSONC="yes", HAVE_JSONC="no")
+  AC_SUBST(JSONC_CFLAGS)
+  AC_SUBST(JSONC_LIBS)
+])
+
 else
 
 dnl not building plugins with external dependencies,
@@ -2393,6 +2434,8 @@ AM_CONDITIONAL(USE_X265, false)
 AM_CONDITIONAL(USE_DTLS, false)
 AM_CONDITIONAL(USE_VULKAN, false)
 AM_CONDITIONAL(USE_TTML, false)
+AM_CONDITIONAL(USE_CKDRM, false)
+AM_CONDITIONAL(USE_JSONC, false)
 
 fi dnl of EXT plugins
 
@@ -2519,6 +2562,7 @@ gst/frei0r/Makefile
 gst/gaudieffects/Makefile
 gst/geometrictransform/Makefile
 gst/gdp/Makefile
+gst/h265combiner/Makefile
 gst/id3tag/Makefile
 gst/inter/Makefile
 gst/interlace/Makefile
@@ -2533,6 +2577,7 @@ gst/mpegtsdemux/Makefile
 gst/mpegtsmux/Makefile
 gst/mpegtsmux/tsmux/Makefile
 gst/mpegpsmux/Makefile
+gst/multiapp/Makefile
 gst/mxf/Makefile
 gst/netsim/Makefile
 gst/onvif/Makefile
@@ -2560,11 +2605,13 @@ gst-libs/Makefile
 gst-libs/gst/Makefile
 gst-libs/gst/adaptivedemux/Makefile
 gst-libs/gst/basecamerabinsrc/Makefile
+gst-libs/gst/basedrm/Makefile
 gst-libs/gst/insertbin/Makefile
 gst-libs/gst/interfaces/Makefile
 gst-libs/gst/isoff/Makefile
 gst-libs/gst/codecparsers/Makefile
 gst-libs/gst/mpegts/Makefile
+gst-libs/gst/multiapp/Makefile
 gst-libs/gst/uridownloader/Makefile
 gst-libs/gst/wayland/Makefile
 gst-libs/gst/webrtc/Makefile
@@ -2686,6 +2733,7 @@ ext/dtls/Makefile
 ext/webrtc/Makefile
 ext/webrtcdsp/Makefile
 ext/ttml/Makefile
+ext/ckdrm/Makefile
 po/Makefile.in
 docs/Makefile
 docs/plugins/Makefile
@@ -2710,6 +2758,8 @@ pkgconfig/gstreamer-bad-video.pc
 pkgconfig/gstreamer-bad-video-uninstalled.pc
 pkgconfig/gstreamer-bad-audio.pc
 pkgconfig/gstreamer-bad-audio-uninstalled.pc
+pkgconfig/gstreamer-multiapp.pc
+pkgconfig/gstreamer-multiapp-uninstalled.pc
 tools/Makefile
 m4/Makefile
 )

@@ -1405,13 +1405,13 @@ mpegtsmux_collected_buffer (GstCollectPads * pads, GstCollectData * data,
       "Chose stream for output (PID: 0x%04x)", best->pid);
 
   if (GST_CLOCK_TIME_IS_VALID (GST_BUFFER_PTS (buf))) {
-    pts = GSTTIME_TO_MPEGTIME (GST_BUFFER_PTS (buf));
+    pts = GSTTIME_TO_MPEGTIME_TSMUX (GST_BUFFER_PTS (buf));
     GST_DEBUG_OBJECT (mux, "Buffer has PTS  %" GST_TIME_FORMAT " pts %"
         G_GINT64_FORMAT, GST_TIME_ARGS (GST_BUFFER_PTS (buf)), pts);
   }
 
   if (GST_CLOCK_STIME_IS_VALID (best->dts)) {
-    dts = GSTTIME_TO_MPEGTIME (best->dts);
+    dts = GSTTIME_TO_MPEGTIME_TSMUX (best->dts);
     GST_DEBUG_OBJECT (mux, "Buffer has DTS %" GST_STIME_FORMAT " dts %"
         G_GINT64_FORMAT, GST_STIME_ARGS (best->dts), dts);
   }

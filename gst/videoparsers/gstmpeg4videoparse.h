@@ -52,6 +52,7 @@ struct _GstMpeg4VParse {
   gint vop_offset;
   gboolean vo_found;
   gboolean config_found;
+  gboolean vop_coded;
   gboolean update_caps;
   gboolean sent_codec_tag;
 
@@ -71,6 +72,14 @@ struct _GstMpeg4VParse {
   guint interval;
   GstClockTime pending_key_unit_ts;
   GstEvent *force_key_unit_event;
+  /* for VOL */
+  gboolean vol_present;
+  gint height;
+  gint width;
+  gint fps_num, fps_den;
+  /* For reassign the timestamp */
+  GstClockTime prev_pts;
+  GstClockTime prev_dts;
 };
 
 struct _GstMpeg4VParseClass {

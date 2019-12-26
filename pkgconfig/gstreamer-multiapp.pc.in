@@ -1,0 +1,11 @@
+prefix=@prefix@
+exec_prefix=@exec_prefix@
+libdir=@libdir@
+includedir=@includedir@/gstreamer-@GST_API_VERSION@
+
+Name: GStreamer Multiple AppSrc Library
+Description: Multiple AppSrc element handler
+Requires: gstreamer-@GST_API_VERSION@ gstreamer-base-@GST_API_VERSION@
+Version: @VERSION@
+Libs: -L${libdir} -lgstmultiapp-@GST_API_VERSION@
+Cflags: -I${includedir}

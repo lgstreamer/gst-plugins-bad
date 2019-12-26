@@ -307,7 +307,8 @@ prepare_src_pad (MpegTSBase * base, MpegTSParse2 * parse)
     return TRUE;
 
   /* If there's no packet_size yet, we can't set caps yet */
-  if (G_UNLIKELY (base->packetizer->packet_size == 0))
+  if (G_UNLIKELY (base->packetizer->packet_size == 0)
+      || (!base->packetizer->know_packet_size))
     return FALSE;
 
   stream_id =

@@ -736,13 +736,16 @@ hls_demux_suite (void)
   tcase_add_test (tc_basicTest, testFragmentNotFound);
   tcase_add_test (tc_basicTest, testFragmentDownloadError);
   tcase_add_test (tc_basicTest, testSeek);
-  tcase_add_test (tc_basicTest, testSeekKeyUnitPosition);
   tcase_add_test (tc_basicTest, testSeekPosition);
   tcase_add_test (tc_basicTest, testSeekUpdateStopPosition);
+
+#if 0
+  tcase_add_test (tc_basicTest, testSeekKeyUnitPosition);
   tcase_add_test (tc_basicTest, testSeekSnapBeforePosition);
   tcase_add_test (tc_basicTest, testSeekSnapAfterPosition);
   tcase_add_test (tc_basicTest, testReverseSeekSnapBeforePosition);
   tcase_add_test (tc_basicTest, testReverseSeekSnapAfterPosition);
+#endif
 
   tcase_add_unchecked_fixture (tc_basicTest, gst_adaptive_demux_test_setup,
       gst_adaptive_demux_test_teardown);

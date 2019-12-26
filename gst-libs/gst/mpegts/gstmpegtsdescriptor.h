@@ -150,6 +150,8 @@ typedef enum {
   /* 0x80 - 0xFE are user defined */
   GST_MTS_DESC_AC3_AUDIO_STREAM                 = 0x81,
   GST_MTS_DESC_DTG_LOGICAL_CHANNEL              = 0x83,    /* from DTG D-Book */
+  GST_MTS_DESC_DOVI_VIDEO_STREAM                = 0xB0,    /* from Dolby Vision Streams (HDR) Spec */
+  GST_MTS_DESC_ENHANCED_AC3_AUDIO_STREAM        = 0xCC,    /* from ATSC A/52:2012 */
 } GstMpegtsMiscDescriptorType;
 
 /**
@@ -232,7 +234,8 @@ typedef enum {
   GST_MTS_DESC_ISDB_CONNECTED_TRANSMISSION      = 0xdd,
   GST_MTS_DESC_ISDB_CONTENT_AVAILABILITY        = 0xde,
   /* ... */
-  GST_MTS_DESC_ISDB_SERVICE_GROUP               = 0xe0
+  GST_MTS_DESC_ISDB_SERVICE_GROUP               = 0xe0,
+  GST_MTS_DESC_ISDB_DATA_COMPONENT              = 0xfd
   
 } GstMpegtsISDBDescriptorType;
 

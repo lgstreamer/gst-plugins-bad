@@ -640,6 +640,30 @@ _gst_mpegts_pmt_free (GstMpegtsPMT * pmt)
 G_DEFINE_BOXED_TYPE (GstMpegtsPMT, gst_mpegts_pmt,
     (GBoxedCopyFunc) _gst_mpegts_pmt_copy, (GFreeFunc) _gst_mpegts_pmt_free);
 
+/* This function counts the audio stream,
+  * and setting the audio number value when the demux is parsing PMT.
+  * The request is come from MHEG */
+static gboolean
+gst_mpegts_section_is_audio (guint8 stream_type)
+{
+  switch (stream_type) {
+    case GST_MPEGTS_STREAM_TYPE_AUDIO_MPEG1:
+    case GST_MPEGTS_STREAM_TYPE_AUDIO_MPEG2:
+    case GST_MPEGTS_STREAM_TYPE_AUDIO_AAC_ADTS:
+    case GST_MPEGTS_STREAM_TYPE_AUDIO_AAC_LATM:
+    case ST_PS_AUDIO_AC3:
+    case ST_PS_AUDIO_DTS:
+    case ST_PS_AUDIO_LPCM:
+    case ST_BD_AUDIO_DTS:
+    case ST_BD_AUDIO_DTS_HD:
+    case ST_BD_AUDIO_DTS_HD_MASTER_AUDIO:
+    case ST_BD_AUDIO_EAC3:
+    case ST_BD_AUDIO_AC3_TRUE_HD:
+      return TRUE;
+    default:
+      return FALSE;
+  }
+}
 
 static gpointer
 _parse_pmt (GstMpegtsSection * section)
@@ -710,6 +734,13 @@ _parse_pmt (GstMpegtsSection * section)
         gst_mpegts_parse_descriptors (data, stream_info_length);
     if (stream->descriptors == NULL)
       goto error;
+
+    /* Plus the audio number. It's for MHEG. */
+    if (gst_mpegts_section_is_audio (stream->stream_type)
+        || gst_mpegts_find_descriptor (stream->descriptors,
+            GST_MTS_DESC_DVB_AC3))
+      pmt->audio_number++;
+
     data += stream_info_length;
 
     i += 1;

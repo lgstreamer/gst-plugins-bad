@@ -60,7 +60,8 @@ G_BEGIN_DECLS
  */
 #define GST_ADAPTIVE_DEMUX_SINK_PAD(obj)        (((GstAdaptiveDemux *) (obj))->sinkpad)
 
-#define GST_ADAPTIVE_DEMUX_IN_TRICKMODE_KEY_UNITS(obj) ((((GstAdaptiveDemux*)(obj))->segment.flags & GST_SEGMENT_FLAG_TRICKMODE_KEY_UNITS) == GST_SEGMENT_FLAG_TRICKMODE_KEY_UNITS)
+#define GST_ADAPTIVE_DEMUX_IN_TRICKMODE_KEY_UNITS(obj) ((((GstAdaptiveDemux*)(obj))->segment.flags & GST_SEGMENT_FLAG_TRICKMODE_KEY_UNITS) == GST_SEGMENT_FLAG_TRICKMODE_KEY_UNITS \
+                                                        && !((GstAdaptiveDemux*)(obj))->disable_keyunit_trick)
 
 #define GST_ADAPTIVE_DEMUX_STREAM_PAD(obj)      (((GstAdaptiveDemuxStream *) (obj))->pad)
 
@@ -75,6 +76,10 @@ G_BEGIN_DECLS
  */
 #define GST_ADAPTIVE_DEMUX_STATISTICS_MESSAGE_NAME "adaptive-streaming-statistics"
 
+#define GST_ADAPTIVE_DEMUX_RESOURCE_MESSAGE_NAME "adaptive-streaming-resource"
+
+#define GST_ADAPTIVE_DEMUX_ERROR_MESSAGE_NAME "adaptive-streaming-error"
+
 #define GST_ELEMENT_ERROR_FROM_ERROR(el, msg, err) G_STMT_START { \
   gchar *__dbg = g_strdup_printf ("%s: %s", msg, err->message);         \
   GST_WARNING_OBJECT (el, "error: %s", __dbg);                          \
@@ -86,6 +91,16 @@ G_BEGIN_DECLS
 
 /* DEPRECATED */
 #define GST_ADAPTIVE_DEMUX_FLOW_END_OF_FRAGMENT GST_FLOW_CUSTOM_SUCCESS_1
+
+#define IS_SNAP_SEEK(f) (f & (GST_SEEK_FLAG_SNAP_BEFORE |	  \
+                              GST_SEEK_FLAG_SNAP_AFTER |	  \
+                              GST_SEEK_FLAG_SNAP_NEAREST |	  \
+			      GST_SEEK_FLAG_TRICKMODE_KEY_UNITS | \
+			      GST_SEEK_FLAG_KEY_UNIT))
+
+#define SEEK_UPDATES_PLAY_POSITION(r, start_type, stop_type) \
+  ((r >= 0 && start_type != GST_SEEK_TYPE_NONE) || \
+   (r < 0 && stop_type != GST_SEEK_TYPE_NONE))
 
 typedef struct _GstAdaptiveDemuxStreamFragment GstAdaptiveDemuxStreamFragment;
 typedef struct _GstAdaptiveDemuxStream GstAdaptiveDemuxStream;
@@ -129,13 +144,16 @@ struct _GstAdaptiveDemuxStream
 
   GstAdaptiveDemux *demux;
 
+  GstStream *object;
+
   GstSegment segment;
 
-  GstCaps *pending_caps;
+  gboolean pending_caps;
   GstEvent *pending_segment;
-  GstTagList *pending_tags;
+  gboolean pending_tags;
   gboolean need_header;
   GList *pending_events;
+  GstEvent *pending_stream_start;
 
   GstFlowReturn last_ret;
   GError *last_error;
@@ -195,6 +213,10 @@ struct _GstAdaptiveDemuxStream
   gboolean eos;
 
   gboolean do_block; /* TRUE if stream should block on preroll */
+
+  gboolean is_static; /* TRUE if stream should be maintained during playback */
+
+  gboolean handle_eos;
 };
 
 /**
@@ -207,7 +229,7 @@ struct _GstAdaptiveDemux
   /*< private >*/
   GstBin     bin;
 
-  gboolean running;
+  gint running;
 
   gsize stream_struct_size;
 
@@ -224,17 +246,29 @@ struct _GstAdaptiveDemux
 
   gchar *manifest_uri;
   gchar *manifest_base_uri;
+  gchar *user_agent;
+  gchar **cookies;
+  gchar *referer;
 
   /* Properties */
   gfloat bitrate_limit;         /* limit of the available bitrate to use */
   guint connection_speed;
+  guint min_bitrate;
+  guint max_bitrate;
+  guint start_bitrate;
 
   gboolean have_group_id;
   guint group_id;
 
+  gboolean disable_keyunit_trick;
+
   /* Realtime clock */
   GstClock *realtime_clock;
   gint64 clock_offset; /* offset between realtime_clock and UTC (in usec) */
+
+  gboolean manifest_expired;
+
+  gboolean soft_flush;
 
   /* < private > */
   GstAdaptiveDemuxPrivate *priv;
@@ -482,6 +516,20 @@ struct _GstAdaptiveDemuxClass
    * Return: %TRUE if the playlist needs to be refreshed periodically by the demuxer.
    */
   gboolean (*requires_periodical_playlist_update) (GstAdaptiveDemux * demux);
+
+  /**
+   * notify_adaptive_streaming_resource:
+   * @demux: #GstAdaptiveDemux
+   *
+   * Request subclass to post "adaptive-streaming-resource" message of which type
+   * is GST_MESSAGE_ELEMENT.
+   */
+  void (*notify_adaptive_streaming_resource) (GstAdaptiveDemux * demux);
+
+  void (*handle_sink_pad_linked) (GstAdaptiveDemux * demux, GstPad * pad, GstPad * peer);
+
+  /* signals */
+  gint (*current_bitrate) (GstAdaptiveDemux * demux, guint64 current_download_bitrate);
 };
 
 GST_ADAPTIVE_DEMUX_API
@@ -509,6 +557,14 @@ void gst_adaptive_demux_stream_set_tags (GstAdaptiveDemuxStream * stream,
                                          GstTagList * tags);
 
 GST_ADAPTIVE_DEMUX_API
+void gst_adaptive_demux_stream_set_stream_flags (GstAdaptiveDemuxStream * stream,
+                                                 GstStreamFlags flags);
+
+GST_ADAPTIVE_DEMUX_API
+void gst_adaptive_demux_stream_set_stream_type  (GstAdaptiveDemuxStream * stream,
+                                                 GstStreamType stream_type);
+
+GST_ADAPTIVE_DEMUX_API
 void gst_adaptive_demux_stream_fragment_clear (GstAdaptiveDemuxStreamFragment * f);
 
 GST_ADAPTIVE_DEMUX_API
@@ -529,7 +585,15 @@ GstClockTime gst_adaptive_demux_get_monotonic_time (GstAdaptiveDemux * demux);
 GST_ADAPTIVE_DEMUX_API
 GDateTime *gst_adaptive_demux_get_client_now_utc (GstAdaptiveDemux * demux);
 
+GST_EXPORT
+void gst_adaptive_demux_notify_manifest_expired (GstAdaptiveDemux * demux);
+
+GST_EXPORT
+GstDateTime *gst_adaptive_demux_parse_http_head_date (const gchar * http_date);
+
+GST_ADAPTIVE_DEMUX_API
+gboolean gst_adaptive_demux_is_running (GstAdaptiveDemux * demux);
+
 G_END_DECLS
 
 #endif
-

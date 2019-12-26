@@ -108,7 +108,40 @@ gst_m3u8_unref (GstM3U8 * self)
     g_list_free (self->files);
 
     g_free (self->last_data);
+    g_free (self->media_name);
     g_mutex_clear (&self->lock);
+    g_free (self);
+  }
+}
+
+static GstM3U8InitFile *
+gst_m3u8_init_file_new (gchar * uri)
+{
+  GstM3U8InitFile *file;
+
+  file = g_new0 (GstM3U8InitFile, 1);
+  file->uri = uri;
+  file->ref_count = 1;
+
+  return file;
+}
+
+static GstM3U8InitFile *
+gst_m3u8_init_file_ref (GstM3U8InitFile * ifile)
+{
+  g_assert (ifile != NULL && ifile->ref_count > 0);
+
+  g_atomic_int_add (&ifile->ref_count, 1);
+  return ifile;
+}
+
+static void
+gst_m3u8_init_file_unref (GstM3U8InitFile * self)
+{
+  g_return_if_fail (self != NULL && self->ref_count > 0);
+
+  if (g_atomic_int_dec_and_test (&self->ref_count)) {
+    g_free (self->uri);
     g_free (self);
   }
 }
@@ -144,9 +177,12 @@ gst_m3u8_media_file_unref (GstM3U8MediaFile * self)
   g_return_if_fail (self != NULL && self->ref_count > 0);
 
   if (g_atomic_int_dec_and_test (&self->ref_count)) {
+    if (self->init_file)
+      gst_m3u8_init_file_unref (self->init_file);
     g_free (self->title);
     g_free (self->uri);
     g_free (self->key);
+    g_free (self->protection_meta);
     g_free (self);
   }
 }
@@ -322,6 +358,26 @@ check_media_seqnums (GstM3U8 * self, GList * previous_files)
     return TRUE;
   }
 
+  /* If we have MEDIA-SEQUENCE, ensure that it's consistent. If it is not,
+   * the client SHOULD halt playback (6.3.4), which is what we do then.
+   *
+   * If we don't have MEDIA-SEQUENCE, we check URIs in the previous and
+   * current playlist to calculate the/a correct MEDIA-SEQUENCE for the new
+   * playlist in relation to the old. That is, same URIs get the same number
+   * and later URIs get higher numbers */
+
+  if (!self->files || !self->targetduration) {
+    self->reload_interval = 10 * GST_SECOND;
+    GST_WARNING ("Abnormal playlist from server!");
+    return FALSE;
+  }
+
+  if (self->version > 5)
+    self->reload_interval = self->targetduration;
+  else
+    self->reload_interval =
+        GST_M3U8_MEDIA_FILE (g_list_last (self->files)->data)->duration;
+
   /* Find first case of higher/equal sequence number in new playlist.
    * From there on we can linearly step ahead */
   for (l = self->files; l; l = l->next) {
@@ -331,7 +387,14 @@ check_media_seqnums (GstM3U8 * self, GList * previous_files)
     for (m = previous_files; m; m = m->next) {
       f2 = m->data;
 
-      if (f1->sequence >= f2->sequence) {
+      if (f1->sequence > f2->sequence) {
+        match = TRUE;
+        break;
+      } else if (f1->sequence == f2->sequence || g_str_equal (f1->uri, f2->uri)) {
+        /* Playlist has not changed */
+        GST_DEBUG ("Reducing reload interval to half.");
+        if (self->reload_interval > self->targetduration / 2)
+          self->reload_interval /= 2;
         match = TRUE;
         break;
       }
@@ -349,9 +412,10 @@ check_media_seqnums (GstM3U8 * self, GList * previous_files)
      * any in the old. This is bad! */
     GST_ERROR ("Media sequence doesn't continue: last new %" G_GINT64_FORMAT
         " < last old %" G_GINT64_FORMAT, f1->sequence, f2->sequence);
+    self->highest_sequence_number = f1->sequence;
     return FALSE;
   }
-
+#if 0
   for (; l && m; l = l->next, m = m->next) {
     f1 = l->data;
     f2 = m->data;
@@ -371,6 +435,7 @@ check_media_seqnums (GstM3U8 * self, GList * previous_files)
       return FALSE;
     }
   }
+#endif
 
   /* All good if we're getting here */
   return TRUE;
@@ -452,12 +517,14 @@ gst_m3u8_update (GstM3U8 * self, gchar * data)
   gchar *title, *end;
   gboolean discontinuity = FALSE;
   gchar *current_key = NULL;
+  gchar *protection = NULL;
   gboolean have_iv = FALSE;
   guint8 iv[16] = { 0, };
   gint64 size = -1, offset = -1;
   gint64 mediasequence;
   GList *previous_files = NULL;
   gboolean have_mediasequence = FALSE;
+  GstM3U8InitFile *last_init_file = NULL;
 
   g_return_val_if_fail (self != NULL, FALSE);
   g_return_val_if_fail (data != NULL, FALSE);
@@ -534,7 +601,7 @@ gst_m3u8_update (GstM3U8 * self, gchar * data)
             GST_WRITE_UINT32_BE (iv, file->sequence);
           }
         }
-
+        file->protection_meta = protection ? g_strdup (protection) : NULL;
         if (size != -1) {
           file->size = size;
           if (offset != -1) {
@@ -555,6 +622,8 @@ gst_m3u8_update (GstM3U8 * self, gchar * data)
         }
 
         file->discont = discontinuity;
+        if (last_init_file)
+          file->init_file = gst_m3u8_init_file_ref (last_init_file);
 
         duration = 0;
         title = NULL;
@@ -603,7 +672,6 @@ gst_m3u8_update (GstM3U8 * self, gchar * data)
         if (int_from_string (data + 30, &data, &val)
             && val != self->discont_sequence) {
           self->discont_sequence = val;
-          discontinuity = TRUE;
         }
       } else if (g_str_has_prefix (data_ext_x, "DISCONTINUITY")) {
         self->discont_sequence++;
@@ -613,6 +681,18 @@ gst_m3u8_update (GstM3U8 * self, gchar * data)
         GST_DEBUG ("FIXME parse date");
       } else if (g_str_has_prefix (data_ext_x, "ALLOW-CACHE:")) {
         self->allowcache = g_ascii_strcasecmp (data + 19, "YES") == 0;
+      } else if (g_str_has_prefix (data_ext_x, "START")) {
+        gchar *v, *a;
+        data = data + 13;
+        while (data && parse_attributes (&data, &a, &v)) {
+          if (g_str_equal (a, "TIME-OFFSET")) {
+            gdouble fval;
+            if (double_from_string (v, &v, &fval)) {
+              self->has_start = TRUE;
+              self->start_time_offset = fval;
+            }
+          }
+        }
       } else if (g_str_has_prefix (data_ext_x, "KEY:")) {
         gchar *v, *a;
 
@@ -622,6 +702,9 @@ gst_m3u8_update (GstM3U8 * self, gchar * data)
         have_iv = FALSE;
         g_free (current_key);
         current_key = NULL;
+        g_free (protection);
+        protection = NULL;
+
         while (data && parse_attributes (&data, &a, &v)) {
           if (g_str_equal (a, "URI")) {
             current_key =
@@ -658,6 +741,13 @@ gst_m3u8_update (GstM3U8 * self, gchar * data)
             have_iv = TRUE;
           } else if (g_str_equal (a, "METHOD")) {
             if (!g_str_equal (v, "AES-128")) {
+              if (g_strrstr (v, "SAMPLE-AES")) {
+                g_free (current_key);
+                current_key = NULL;
+                protection = g_strdup (data);
+                GST_DEBUG ("Encryption method is %s %s", v, protection);
+                break;
+              }
               GST_WARNING ("Encryption method %s not supported", v);
               continue;
             }
@@ -671,6 +761,47 @@ gst_m3u8_update (GstM3U8 * self, gchar * data)
             goto next_line;
         } else {
           goto next_line;
+        }
+      } else if (g_str_has_prefix (data_ext_x, "MAP:")) {
+        gchar *v, *a, *header_uri = NULL;
+
+        data = data + 11;
+
+        while (data != NULL && parse_attributes (&data, &a, &v)) {
+          if (strcmp (a, "URI") == 0) {
+            header_uri =
+                uri_join (self->base_uri ? self->base_uri : self->uri, v);
+          } else if (strcmp (a, "BYTERANGE") == 0) {
+            if (int64_from_string (v, &v, &size)) {
+              if (*v == '@' && !int64_from_string (v + 1, &v, &offset)) {
+                g_free (header_uri);
+                goto next_line;
+              }
+            } else {
+              g_free (header_uri);
+              goto next_line;
+            }
+          }
+        }
+
+        if (header_uri) {
+          GstM3U8InitFile *init_file;
+          init_file = gst_m3u8_init_file_new (header_uri);
+
+          if (size != -1) {
+            init_file->size = size;
+            if (offset != -1)
+              init_file->offset = offset;
+            else
+              init_file->offset = 0;
+          } else {
+            init_file->size = -1;
+            init_file->offset = 0;
+          }
+          if (last_init_file)
+            gst_m3u8_init_file_unref (last_init_file);
+
+          last_init_file = init_file;
         }
       } else {
         GST_LOG ("Ignored line: %s", data);
@@ -688,7 +819,13 @@ gst_m3u8_update (GstM3U8 * self, gchar * data)
   g_free (current_key);
   current_key = NULL;
 
+  g_free (protection);
+  protection = NULL;
+
   self->files = g_list_reverse (self->files);
+
+  if (last_init_file)
+    gst_m3u8_init_file_unref (last_init_file);
 
   if (previous_files) {
     gboolean consistent = TRUE;
@@ -785,10 +922,92 @@ gst_m3u8_update (GstM3U8 * self, gchar * data)
         file = file->prev;
         sequence_pos -= GST_M3U8_MEDIA_FILE (file->data)->duration;
       }
+      if (self->has_start
+          && g_list_length (self->files) >
+          GST_M3U8_LIVE_MIN_FRAGMENT_DISTANCE + 1) {
+        GstClockTime offset = GST_CLOCK_TIME_NONE;
+
+        /* A positive number indicates a time offset from the beginning of
+         * the Playlist. */
+        if (self->start_time_offset >= 0) {
+          offset = self->start_time_offset * GST_SECOND;
+          GST_DEBUG ("positive start offset %" GST_TIME_FORMAT
+              " duration %" GST_TIME_FORMAT, GST_TIME_ARGS (offset),
+              GST_TIME_ARGS (self->duration));
+          if (offset < sequence_pos) {
+            while (file->prev && offset < sequence_pos) {
+              file = file->prev;
+              sequence_pos -= GST_M3U8_MEDIA_FILE (file->data)->duration;
+            }
+          }
+        } else {
+          /* A negative number indicates a negative time offset from the
+           * end of the last Media Segment in the Playlist. */
+          offset = (self->start_time_offset * -1) * GST_SECOND;
+          GST_DEBUG ("negative start offset %" GST_TIME_FORMAT
+              " duration %" GST_TIME_FORMAT, GST_TIME_ARGS (offset),
+              GST_TIME_ARGS (self->duration));
+          /* The TIME-OFFSET SHOULD NOT be within three target durations
+           *  of the end of the Playlist file. */
+          if (offset >= self->duration) {
+            sequence_pos = 0;
+            file = g_list_first (self->files);
+          } else if (self->duration - offset < sequence_pos) {
+            while (file->prev && self->duration - offset < sequence_pos) {
+              file = file->prev;
+              sequence_pos -= GST_M3U8_MEDIA_FILE (file->data)->duration;
+            }
+          }
+        }
+      }
       self->sequence_position = sequence_pos;
     } else {
-      file = g_list_first (self->files);
-      self->sequence_position = 0;
+      if (self->has_start) {
+        GstClockTime offset = GST_CLOCK_TIME_NONE;
+        GstClockTime sequence_pos = 0;
+        if (self->start_time_offset >= 0) {
+          offset = self->start_time_offset * GST_SECOND;
+          GST_DEBUG ("positive start offset %" GST_TIME_FORMAT
+              " duration %" GST_TIME_FORMAT, GST_TIME_ARGS (offset),
+              GST_TIME_ARGS (self->duration));
+
+          /* A positive number indicates a time offset from the beginning of
+           * the Playlist. */
+          if (offset > self->duration) {
+            file = g_list_last (self->files);
+            self->sequence_position = self->last_file_end;
+          } else {
+            file = g_list_first (self->files);
+            while (file
+                && sequence_pos + GST_M3U8_MEDIA_FILE (file->data)->duration <=
+                offset) {
+              sequence_pos += GST_M3U8_MEDIA_FILE (file->data)->duration;
+              file = file->next;
+            }
+            self->sequence_position = sequence_pos;
+          }
+        } else {
+          /* A negative number indicates a negative time offset from the
+           * end of the last Media Segment in the Playlist. */
+          offset = (self->start_time_offset * -1) * GST_SECOND;
+          file = g_list_first (self->files);
+          GST_DEBUG ("negative start offset %" GST_TIME_FORMAT
+              " duration %" GST_TIME_FORMAT, GST_TIME_ARGS (offset),
+              GST_TIME_ARGS (self->duration));
+          if (self->duration > offset) {
+            while (file
+                && sequence_pos + GST_M3U8_MEDIA_FILE (file->data)->duration <=
+                self->duration - offset) {
+              sequence_pos += GST_M3U8_MEDIA_FILE (file->data)->duration;
+              file = file->next;
+            }
+          }
+          self->sequence_position = sequence_pos;
+        }
+      } else {
+        file = g_list_first (self->files);
+        self->sequence_position = 0;
+      }
     }
     self->current_file = file;
     self->sequence = GST_M3U8_MEDIA_FILE (file->data)->sequence;
@@ -930,12 +1149,13 @@ m3u8_alternate_advance (GstM3U8 * m3u8, gboolean forward)
   m3u8->current_file_duration = GST_M3U8_MEDIA_FILE (tmp->data)->duration;
 }
 
-void
+gboolean
 gst_m3u8_advance_fragment (GstM3U8 * m3u8, gboolean forward)
 {
   GstM3U8MediaFile *file;
+  gboolean ret = TRUE;
 
-  g_return_if_fail (m3u8 != NULL);
+  g_return_val_if_fail (m3u8 != NULL, FALSE);
 
   GST_M3U8_LOCK (m3u8);
 
@@ -970,15 +1190,8 @@ gst_m3u8_advance_fragment (GstM3U8 * m3u8, gboolean forward)
 
       /* Resync sequence number if the above has failed for live streams */
       if (m3u8->current_file == NULL && GST_M3U8_IS_LIVE (m3u8)) {
-        /* for live streams, start GST_M3U8_LIVE_MIN_FRAGMENT_DISTANCE from
-           the end of the playlist. See section 6.3.3 of HLS draft */
-        gint pos =
-            g_list_length (m3u8->files) - GST_M3U8_LIVE_MIN_FRAGMENT_DISTANCE;
-        m3u8->current_file = g_list_nth (m3u8->files, pos >= 0 ? pos : 0);
-        m3u8->current_file_duration =
-            GST_M3U8_MEDIA_FILE (m3u8->current_file->data)->duration;
-
         GST_WARNING ("Resyncing live playlist");
+        ret = FALSE;
       }
       goto out;
     }
@@ -1002,7 +1215,7 @@ gst_m3u8_advance_fragment (GstM3U8 * m3u8, gboolean forward)
     }
   }
   if (m3u8->current_file) {
-    /* Store duration of the fragment we're using to update the position 
+    /* Store duration of the fragment we're using to update the position
      * the next time we advance */
     m3u8->current_file_duration =
         GST_M3U8_MEDIA_FILE (m3u8->current_file->data)->duration;
@@ -1011,6 +1224,7 @@ gst_m3u8_advance_fragment (GstM3U8 * m3u8, gboolean forward)
 out:
 
   GST_M3U8_UNLOCK (m3u8);
+  return ret;
 }
 
 GstClockTime
@@ -1054,6 +1268,26 @@ gst_m3u8_get_target_duration (GstM3U8 * m3u8)
   GST_M3U8_UNLOCK (m3u8);
 
   return target_duration;
+}
+
+GstClockTime
+gst_m3u8_get_reload_interval (GstM3U8 * m3u8)
+{
+  GstClockTime reload_interval;
+
+  g_return_val_if_fail (m3u8 != NULL, GST_CLOCK_TIME_NONE);
+
+  GST_M3U8_LOCK (m3u8);
+  if (m3u8->reload_interval <= 0) {
+    /* First interval */
+    reload_interval = m3u8->version > 5 ? m3u8->targetduration :
+        GST_M3U8_MEDIA_FILE (g_list_last (m3u8->files)->data)->duration;
+  } else {
+    reload_interval = m3u8->reload_interval;
+  }
+  GST_M3U8_UNLOCK (m3u8);
+
+  return reload_interval;
 }
 
 gchar *
@@ -1158,7 +1392,9 @@ gst_m3u8_get_seek_range (GstM3U8 * m3u8, gint64 * start, gint64 * stop)
     /* min_distance is used to make sure the seek range is never closer than
        GST_M3U8_LIVE_MIN_FRAGMENT_DISTANCE fragments from the end of a live
        playlist - see 6.3.3. "Playing the Playlist file" of the HLS draft */
-    min_distance = GST_M3U8_LIVE_MIN_FRAGMENT_DISTANCE;
+    guint list_length = g_list_length (m3u8->files);
+    min_distance = list_length > GST_M3U8_LIVE_MIN_FRAGMENT_DISTANCE ?
+        GST_M3U8_LIVE_MIN_FRAGMENT_DISTANCE : list_length > 1 ? 1 : 0;
   }
   count = g_list_length (m3u8->files);
 
@@ -1286,6 +1522,10 @@ gst_m3u8_parse_media (gchar * desc, const gchar * base_uri)
       media->forced = g_ascii_strcasecmp (v, "yes") == 0;
     } else if (strcmp (a, "AUTOSELECT") == 0) {
       media->autoselect = g_ascii_strcasecmp (v, "yes") == 0;
+    } else if (strcmp (a, "CHANNELS") == 0) {
+      if (!int_from_string (gst_m3u8_unquote (v), NULL, &media->channels)) {
+        GST_WARNING ("Error while reading CHANNELS");
+      }
     } else {
       /* unhandled: ASSOC-LANGUAGE, INSTREAM-ID, CHARACTERISTICS */
       GST_FIXME ("EXT-X-MEDIA: unhandled attribute: %s = %s", a, v);
@@ -1327,6 +1567,7 @@ existing_stream:
   {
     GST_DEBUG ("EXT-X-MEDIA without URI, describes embedded stream, skipping");
     /* fall through */
+    return media;
   }
 
 out_error:
@@ -1429,6 +1670,75 @@ hls_media_name_compare_func (gconstpointer media, gconstpointer name)
   return strcmp (((GstHLSMedia *) media)->name, (const gchar *) name);
 }
 
+static gint
+hls_variant_bandwidth_compare_func (GstHLSVariantStream * v1,
+    GstHLSVariantStream * v2)
+{
+  return ((GstHLSVariantStream *) v1)->bandwidth ==
+      ((GstHLSVariantStream *) v2)->bandwidth ? 0 : 1;
+}
+
+static void
+gst_hls_parse_variant_stream_type (GstHLSVariantStream * stream)
+{
+  gchar **strings;
+  guint len;
+
+  if (!stream->codecs)
+    return;
+
+  strings = g_strsplit (stream->codecs, ",", -1);
+  len = g_strv_length (strings);
+  g_strfreev (strings);
+
+  GST_LOG ("CODECS: %s", stream->codecs);
+
+  if (len < 2) {
+    if (g_strrstr (stream->codecs, "mp4a") || g_strrstr (stream->codecs, "dts")
+        || g_strrstr (stream->codecs, "ec-3")
+        || g_strrstr (stream->codecs, "ec+3")
+        || g_strrstr (stream->codecs, "ac-3")
+        || g_strrstr (stream->codecs, "ac-4"))
+      stream->stream_type |= GST_STREAM_TYPE_AUDIO;
+    else
+      stream->stream_type |= GST_STREAM_TYPE_VIDEO;
+  } else {
+    stream->stream_type |= GST_STREAM_TYPE_VIDEO;
+    stream->stream_type |= GST_STREAM_TYPE_AUDIO;
+  }
+
+  if (len >= 2) {
+    if (g_strrstr (stream->codecs, "avc")
+        || g_strrstr (stream->codecs, "h264")) {
+      stream->video_codec_preference = GST_HLS_VIDEO_CODEC_H264;
+    } else if (g_strrstr (stream->codecs, "hev")
+        || g_strrstr (stream->codecs, "hvc")
+        || g_strrstr (stream->codecs, "h265")) {
+      stream->video_codec_preference = GST_HLS_VIDEO_CODEC_HEVC;
+    } else if (g_strrstr (stream->codecs, "dvav")) {
+      stream->video_codec_preference = GST_HLS_VIDEO_CODEC_DVAV;
+    } else if (g_strrstr (stream->codecs, "dvhe")) {
+      stream->video_codec_preference = GST_HLS_VIDEO_CODEC_DVHE;
+    } else if (g_strrstr (stream->codecs, "dvh1")) {
+      stream->video_codec_preference = GST_HLS_VIDEO_CODEC_DVH1;
+    }
+
+    if (g_strrstr (stream->codecs, "mp4a")) {
+      stream->audio_codec_preference = GST_HLS_AUDIO_CODEC_MP4A;
+    } else if (g_strrstr (stream->codecs, "ac-3")) {
+      stream->audio_codec_preference = GST_HLS_AUDIO_CODEC_AC3;
+    } else if (g_strrstr (stream->codecs, "ec-3")) {
+      stream->audio_codec_preference = GST_HLS_AUDIO_CODEC_EC3;
+    } else if (g_strrstr (stream->codecs, "ec+3")) {
+      stream->audio_codec_preference = GST_HLS_AUDIO_CODEC_EC3P;
+    }
+    stream->check_preference = TRUE;
+  }
+
+  GST_LOG ("video codec preference: %u audio codec preference: %u",
+      stream->video_codec_preference, stream->audio_codec_preference);
+}
+
 /* Takes ownership of @data */
 GstHLSMasterPlaylist *
 gst_hls_master_playlist_new_from_data (gchar * data, const gchar * base_uri)
@@ -1439,6 +1749,7 @@ gst_hls_master_playlist_new_from_data (gchar * data, const gchar * base_uri)
   gchar *end, *free_data = data;
   gint val, i;
   GList *l;
+  gboolean need_to_set_default_media = FALSE;
 
   if (!g_str_has_prefix (data, "#EXTM3U")) {
     GST_WARNING ("Data doesn't start with #EXTM3U");
@@ -1476,6 +1787,7 @@ gst_hls_master_playlist_new_from_data (gchar * data, const gchar * base_uri)
   data += 7;
   while (TRUE) {
     gchar *r;
+    GList *list;
 
     end = g_utf8_strchr (data, -1, '\n');
     if (end)
@@ -1500,11 +1812,73 @@ gst_hls_master_playlist_new_from_data (gchar * data, const gchar * base_uri)
 
       pending_stream->name = g_strdup (name);
       pending_stream->uri = uri;
+      list = playlist->variants;
 
-      if (find_variant_stream_by_name (playlist->variants, name)
-          || find_variant_stream_by_uri (playlist->variants, uri)) {
-        GST_DEBUG ("Already have a list with this name or URI: %s", name);
-        gst_hls_variant_stream_unref (pending_stream);
+      if (pending_stream->check_preference
+          && g_list_length (playlist->variants) > 0) {
+        GstHLSVariantStream *tmp_stream;
+        tmp_stream = list->data;
+        if (tmp_stream->video_codec_preference <
+            pending_stream->video_codec_preference) {
+          playlist->default_variant = NULL;
+          g_list_free_full (playlist->variants,
+              (GDestroyNotify) gst_hls_variant_stream_unref);
+          playlist->variants = NULL;
+          GST_DEBUG
+              ("Variant with a higher video codec preference is available.");
+        } else if (tmp_stream->audio_codec_preference <
+            pending_stream->audio_codec_preference) {
+          playlist->default_variant = NULL;
+          g_list_free_full (playlist->variants,
+              (GDestroyNotify) gst_hls_variant_stream_unref);
+          playlist->variants = NULL;
+          GST_DEBUG
+              ("Variant with a higher audio codec preference is available.");
+        }
+      }
+
+      if (playlist->variants != NULL &&
+          (find_variant_stream_by_name (playlist->variants, name)
+              || find_variant_stream_by_uri (playlist->variants, uri)
+              || g_list_find_custom (list, pending_stream,
+                  (GCompareFunc) hls_variant_bandwidth_compare_func))) {
+        GstHLSVariantStream *tmp_stream;
+        tmp_stream = list->data;
+        /* Although audio codecs are the same, channels may be different */
+        if (tmp_stream->audio_codec_preference ==
+            pending_stream->audio_codec_preference) {
+          if (tmp_stream->media_groups[GST_HLS_MEDIA_TYPE_AUDIO]
+              && pending_stream->media_groups[GST_HLS_MEDIA_TYPE_AUDIO]) {
+            GList *tmp_mlist, *pending_stream_mlist;
+            GstHLSMedia *tmp_media, *pending_stream_media;
+            tmp_mlist =
+                g_hash_table_lookup (media_groups[GST_HLS_MEDIA_TYPE_AUDIO],
+                tmp_stream->media_groups[GST_HLS_MEDIA_TYPE_AUDIO]);
+            pending_stream_mlist =
+                g_hash_table_lookup (media_groups[GST_HLS_MEDIA_TYPE_AUDIO],
+                pending_stream->media_groups[GST_HLS_MEDIA_TYPE_AUDIO]);
+            tmp_media = tmp_mlist->data;
+            pending_stream_media = pending_stream_mlist->data;
+            if (pending_stream_media->channels > tmp_media->channels) {
+              playlist->default_variant = NULL;
+              g_list_free_full (playlist->variants,
+                  (GDestroyNotify) gst_hls_variant_stream_unref);
+              playlist->variants = NULL;
+              GST_DEBUG
+                  ("Variant with a higher audio channel (%d) is available.",
+                  pending_stream_media->channels);
+              gst_m3u8_set_uri (pending_stream->m3u8, uri, NULL, name);
+              playlist->variants =
+                  g_list_append (playlist->variants, pending_stream);
+              playlist->default_variant = NULL;
+              playlist->default_variant =
+                  gst_hls_variant_stream_ref (pending_stream);
+            }
+          }
+        } else {
+          GST_DEBUG ("Already have a list with this name or URI: %s", name);
+          gst_hls_variant_stream_unref (pending_stream);
+        }
       } else {
         GST_INFO ("stream %s @ %u: %s", name, pending_stream->bandwidth, uri);
         gst_m3u8_set_uri (pending_stream->m3u8, uri, NULL, name);
@@ -1526,6 +1900,8 @@ gst_hls_master_playlist_new_from_data (gchar * data, const gchar * base_uri)
 
       stream = gst_hls_variant_stream_new ();
       stream->iframe = g_str_has_prefix (data, "#EXT-X-I-FRAME-STREAM-INF:");
+      stream->audio_codec_preference = GST_HLS_AUDIO_CODEC_UNKNOWN;
+      stream->video_codec_preference = GST_HLS_VIDEO_CODEC_UNKNOWN;
       data += stream->iframe ? 26 : 18;
       while (data && parse_attributes (&data, &a, &v)) {
         if (g_str_equal (a, "BANDWIDTH")) {
@@ -1544,7 +1920,10 @@ gst_hls_master_playlist_new_from_data (gchar * data, const gchar * base_uri)
         } else if (g_str_equal (a, "CODECS")) {
           g_free (stream->codecs);
           stream->codecs = g_strdup (v);
+          gst_hls_parse_variant_stream_type (stream);
         } else if (g_str_equal (a, "RESOLUTION")) {
+          /* this variant stream include video */
+          stream->stream_type |= GST_STREAM_TYPE_VIDEO;
           if (!int_from_string (v, &v, &stream->width))
             GST_WARNING ("Error while reading RESOLUTION width");
           if (!v || *v != 'x') {
@@ -1576,7 +1955,14 @@ gst_hls_master_playlist_new_from_data (gchar * data, const gchar * base_uri)
           /* closed captions will be embedded inside the video stream, ignore */
         }
       }
-
+      if (!stream->codecs && stream->bandwidth >= 100000) {
+        GST_WARNING
+            ("Codec attribute is not available. Assuming this variant is video.");
+        stream->stream_type |= GST_STREAM_TYPE_VIDEO;
+        /* If codecs are not available in the manifest,
+         * ignore trying to find a preferred codec playlist set */
+        stream->check_preference = FALSE;
+      }
       if (stream->iframe) {
         if (find_variant_stream_by_uri (playlist->iframe_variants, stream->uri)) {
           GST_DEBUG ("Already have a list with this URI");
@@ -1601,6 +1987,12 @@ gst_hls_master_playlist_new_from_data (gchar * data, const gchar * base_uri)
       if (media == NULL)
         goto next_line;
 
+      if (media->is_default && media->uri == NULL) {
+        GST_INFO
+            ("media data for this rendition is included in the Media Playlist");
+        need_to_set_default_media = TRUE;
+      }
+
       if (media_groups[media->mtype] == NULL) {
         media_groups[media->mtype] =
             g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
@@ -1611,7 +2003,9 @@ gst_hls_master_playlist_new_from_data (gchar * data, const gchar * base_uri)
       /* make sure there isn't already a media with the same name */
       if (!g_list_find_custom (list, media->name, hls_media_name_compare_func)) {
         g_hash_table_replace (media_groups[media->mtype],
-            g_strdup (media->group_id), g_list_append (list, media));
+            g_strdup (media->group_id),
+            media->is_default ? g_list_prepend (list,
+                media) : g_list_append (list, media));
         GST_INFO ("Added media %s to group %s", media->name, media->group_id);
       } else {
         GST_WARNING ("  media with name '%s' already exists in group '%s'!",
@@ -1635,13 +2029,108 @@ gst_hls_master_playlist_new_from_data (gchar * data, const gchar * base_uri)
 
   g_free (free_data);
 
+  /* Remove duplicated variant stream
+   * e.g., uri of variant stream is belongs to one of alternative rendition's one */
+  for (i = 0; i < GST_HLS_N_MEDIA_TYPES; ++i) {
+    GList *mlist;
+    if (media_groups[i] != NULL) {
+      GList *keys = g_hash_table_get_keys (media_groups[i]);
+      if (keys) {
+        for (l = keys; l; l = l->next) {
+          gchar *group_id = keys->data;
+          mlist = g_hash_table_lookup (media_groups[i], group_id);
+
+          while (mlist != NULL) {
+            GstHLSMedia *media = mlist->data;
+
+            if (media->uri) {
+              GList *iter, *next;
+              for (iter = playlist->variants; iter; iter = next) {
+                GstHLSVariantStream *stream = iter->data;
+
+                next = iter->next;
+
+                if (!g_strcmp0 (stream->uri, media->uri)) {
+                  GST_DEBUG
+                      ("media uri %s exist in variants, remove the stream",
+                      media->uri);
+                  playlist->variants =
+                      g_list_remove_link (playlist->variants, iter);
+                  if (stream == playlist->default_variant) {
+                    gst_hls_variant_stream_unref (stream);
+                    playlist->default_variant = NULL;
+                  }
+                  gst_hls_variant_stream_unref (stream);
+                }
+              }
+            }
+
+            mlist = mlist->next;
+          }
+        }
+        g_list_free (keys);
+      }
+    }
+  }
+
+  /* If we can ensure that there is a video variant,
+   * exclude audio-only variants from list */
+  if (g_list_length (playlist->variants) > 1) {
+    gboolean has_video_variant = FALSE;
+
+    /* 1. search all variants and */
+    for (l = playlist->variants; l != NULL; l = l->next) {
+      GstHLSVariantStream *stream = l->data;
+
+      if (stream->stream_type & GST_STREAM_TYPE_VIDEO) {
+        has_video_variant = TRUE;
+        break;
+      }
+    }
+
+    /* 2. If we have video variants, exclude any audio-only variants */
+    if (has_video_variant) {
+      GList *next;
+
+      for (l = playlist->variants; l != NULL; l = next) {
+        GstHLSVariantStream *stream = l->data;
+
+        next = l->next;
+
+        GST_DEBUG ("stream type = 0x%x", stream->stream_type);
+        if (stream->stream_type == GST_STREAM_TYPE_AUDIO) {
+          GST_DEBUG ("Found audio-only variant, remove");
+
+          playlist->variants = g_list_remove_link (playlist->variants, l);
+
+          if (stream == playlist->default_variant) {
+            gst_hls_variant_stream_unref (stream);
+            playlist->default_variant = NULL;
+          }
+          gst_hls_variant_stream_unref (stream);
+        }
+      }
+    }
+  }
+
+  /* Re-check default variant */
+  if (playlist->default_variant == NULL && playlist->variants) {
+    GstHLSVariantStream *stream =
+        (GstHLSVariantStream *) playlist->variants->data;
+    playlist->default_variant = gst_hls_variant_stream_ref (stream);
+  }
+
   /* Add alternative renditions media to variant streams */
   for (l = playlist->variants; l != NULL; l = l->next) {
     GstHLSVariantStream *stream = l->data;
     GList *mlist;
 
+    if (need_to_set_default_media)
+      stream->assume_default = TRUE;
+
     for (i = 0; i < GST_HLS_N_MEDIA_TYPES; ++i) {
       if (stream->media_groups[i] != NULL && media_groups[i] != NULL) {
+        gint alternative_rendition_order = 0;
         GST_INFO ("Adding %s group '%s' to stream '%s'",
             GST_HLS_MEDIA_TYPE_NAME (i), stream->media_groups[i], stream->name);
 
@@ -1652,6 +2141,7 @@ gst_hls_master_playlist_new_from_data (gchar * data, const gchar * base_uri)
 
         while (mlist != NULL) {
           GstHLSMedia *media = mlist->data;
+          media->track_order = alternative_rendition_order++;
 
           GST_DEBUG ("  %s media %s, uri: %s", GST_HLS_MEDIA_TYPE_NAME (i),
               media->name, media->uri);
@@ -1796,4 +2286,49 @@ gst_hls_master_playlist_get_matching_variant (GstHLSMasterPlaylist * playlist,
   }
 
   return find_variant_stream_by_uri (playlist->variants, current_variant->uri);
+}
+
+guint
+gst_hls_master_playlist_get_initial_bitrate (GstHLSMasterPlaylist *
+    playlist, GstHLSVariantStream * current_variant, guint start_bitrate,
+    guint min_bitrate)
+{
+  GstHLSVariantStream *variant = current_variant;
+  GList *l;
+  guint bitrate_by_start = 0;
+  guint bitrate_by_min = 0;
+
+  if (current_variant == NULL || !current_variant->iframe)
+    l = g_list_last (playlist->variants);
+  else
+    l = g_list_last (playlist->iframe_variants);
+
+  while (l != NULL) {
+    variant = l->data;
+    if (variant->bandwidth <= start_bitrate)
+      break;
+    l = l->prev;
+  }
+
+  bitrate_by_start = variant->bandwidth;
+  GST_TRACE ("bitrate by start: %u", bitrate_by_start);
+
+  if (min_bitrate > 0) {
+    if (current_variant == NULL || !current_variant->iframe)
+      l = g_list_first (playlist->variants);
+    else
+      l = g_list_first (playlist->iframe_variants);
+
+    while (l != NULL) {
+      variant = l->data;
+      if (variant->bandwidth >= min_bitrate)
+        break;
+      l = l->next;
+    }
+
+    bitrate_by_min = variant->bandwidth;
+    GST_TRACE ("bitrate by min: %u", bitrate_by_min);
+  }
+
+  return bitrate_by_start > bitrate_by_min ? bitrate_by_start : bitrate_by_min;
 }

@@ -78,9 +78,12 @@ typedef struct _ADPCMDec
   int rate;
   int channels;
   int blocksize;
+  gboolean need_gap;
+  gdouble seek_rate;
 } ADPCMDec;
 
 GType adpcmdec_get_type (void);
+#define parent_class adpcmdec_parent_class
 G_DEFINE_TYPE (ADPCMDec, adpcmdec, GST_TYPE_AUDIO_DECODER);
 
 static gboolean
@@ -415,6 +418,16 @@ adpcmdec_handle_frame (GstAudioDecoder * bdec, GstBuffer * buffer)
   if (!dec->blocksize)
     return GST_FLOW_NOT_NEGOTIATED;
 
+  if (dec->seek_rate < 0.0 || dec->seek_rate > 2.0) {
+    if (dec->need_gap) {
+      gst_pad_push_event (bdec->srcpad,
+          gst_event_new_gap (0, GST_CLOCK_TIME_NONE));
+      dec->need_gap = FALSE;
+      GST_INFO_OBJECT (bdec, "Send GAP in FF/FR");
+    }
+    return GST_FLOW_OK;
+  }
+
   gst_buffer_map (buffer, &map, GST_MAP_READ);
   outbuf = adpcmdec_decode_block (dec, map.data, dec->blocksize);
   gst_buffer_unmap (buffer, &map);
@@ -431,6 +444,30 @@ adpcmdec_handle_frame (GstAudioDecoder * bdec, GstBuffer * buffer)
 }
 
 static gboolean
+adpcmdec_sink_event (GstAudioDecoder * bdec, GstEvent * event)
+{
+  ADPCMDec *dec = (ADPCMDec *) bdec;
+
+  GST_DEBUG_OBJECT (bdec, "sink event: %s", GST_EVENT_TYPE_NAME (event));
+
+  switch (GST_EVENT_TYPE (event)) {
+    case GST_EVENT_SEGMENT:
+    {
+      const GstSegment *segment;
+      gst_event_parse_segment (event, &segment);
+      dec->seek_rate = segment->rate;
+      dec->need_gap = TRUE;
+      GST_DEBUG_OBJECT (bdec, "seek_rate = %f", dec->seek_rate);
+    }
+      break;
+    default:
+      break;
+  }
+
+  return GST_AUDIO_DECODER_CLASS (parent_class)->sink_event (bdec, event);
+}
+
+static gboolean
 adpcmdec_start (GstAudioDecoder * bdec)
 {
   ADPCMDec *dec = (ADPCMDec *) bdec;
@@ -440,6 +477,8 @@ adpcmdec_start (GstAudioDecoder * bdec)
   dec->blocksize = 0;
   dec->rate = 0;
   dec->channels = 0;
+  dec->need_gap = TRUE;
+  dec->seek_rate = 1.0;
 
   return TRUE;
 }
@@ -480,6 +519,7 @@ adpcmdec_class_init (ADPCMDecClass * klass)
   base_class->set_format = GST_DEBUG_FUNCPTR (adpcmdec_set_format);
   base_class->parse = GST_DEBUG_FUNCPTR (adpcmdec_parse);
   base_class->handle_frame = GST_DEBUG_FUNCPTR (adpcmdec_handle_frame);
+  base_class->sink_event = GST_DEBUG_FUNCPTR (adpcmdec_sink_event);
 }
 
 static gboolean

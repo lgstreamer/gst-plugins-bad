@@ -16,6 +16,12 @@ else
 VOAMRWBENC_DIR =
 endif
 
+if USE_CKDRM
+CKDRM_DIR = ckdrm
+else
+CKDRM_DIR =
+endif
+
 if USE_BS2B
 BS2B_DIR=bs2b
 else
@@ -410,6 +416,7 @@ SUBDIRS=\
 	$(BZ2_DIR) \
 	$(COLORMANAGEMENT_DIR) \
 	$(CHROMAPRINT_DIR) \
+	$(CKDRM_DIR) \
 	$(CURL_DIR) \
 	$(DASH_DIR) \
 	$(DC1394_DIR) \

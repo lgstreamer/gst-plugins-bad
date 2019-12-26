@@ -34,7 +34,6 @@
 #include "mpegtspacketizer.h"
 
 G_BEGIN_DECLS
-
 #define GST_TYPE_MPEGTS_BASE \
   (mpegts_base_get_type())
 #define GST_MPEGTS_BASE(obj) \
@@ -47,9 +46,7 @@ G_BEGIN_DECLS
   (G_TYPE_CHECK_CLASS_TYPE((klass),GST_TYPE_MPEGTS_BASE))
 #define GST_MPEGTS_BASE_GET_CLASS(obj) \
   (G_TYPE_INSTANCE_GET_CLASS ((obj), GST_TYPE_MPEGTS_BASE, MpegTSBaseClass))
-
 #define MPEG_TS_BASE_PACKETIZER(b) (((MpegTSBase*)b)->packetizer)
-
 typedef struct _MpegTSBase MpegTSBase;
 typedef struct _MpegTSBaseClass MpegTSBaseClass;
 typedef struct _MpegTSBaseStream MpegTSBaseStream;
@@ -94,31 +91,52 @@ struct _MpegTSBaseProgram
   gboolean active;
   /* TRUE if this is the first program created */
   gboolean initial_program;
+
+  /* For multi-program stream, we count the number of video stream */
+  guint video_num;
+  /* For multi-program stream, we check whether valid program or not */
+  gboolean is_valid_program;
 };
 
-typedef enum {
+typedef enum
+{
   /* PULL MODE */
-  BASE_MODE_SCANNING,		/* Looking for PAT/PMT */
-  BASE_MODE_SEEKING,		/* Seeking */
-  BASE_MODE_STREAMING,		/* Normal mode (pushing out data) */
+  BASE_MODE_SCANNING,           /* Looking for PAT/PMT */
+  BASE_MODE_SEEKING,            /* Seeking */
+  BASE_MODE_STREAMING,          /* Normal mode (pushing out data) */
 
   /* PUSH MODE */
-  BASE_MODE_PUSHING
+  BASE_MODE_PUSHING,
+  BASE_MODE_SEEK_FOR_SCAN,
 } MpegTSBaseMode;
 
-struct _MpegTSBase {
+enum {
+  DLNA_ORG_OP_NONE          = 0x00,
+  DLNA_ORG_OP_BYTE_RANGE    = 0x01,
+  DLNA_ORG_OP_TIME_RANGE    = 0x10,
+  DLNA_ORG_OP_BOTH_RANGE    = 0x11,
+  DLNA_ORG_OP_INITIAL_VALUE = 0x111,
+};
+
+struct _MpegTSBase
+{
   GstElement element;
 
+  /* Protect flush event during program update */
+  GMutex expose_lock;
+
   GstPad *sinkpad;
+
+  gchar* upstream_id;
 
   /* pull-based behaviour */
   MpegTSBaseMode mode;
 
   /* Current pull offset (also set by seek handler) */
-  guint64	seek_offset;
+  guint64       seek_offset;
 
   /* Cached packetsize */
-  guint16	packetsize;
+  guint16       packetsize;
 
   /* the following vars must be protected with the OBJECT_LOCK as they can be
    * accessed from the application thread and the streaming thread */
@@ -161,9 +179,57 @@ struct _MpegTSBase {
   /* Whether the parent bin is streams-aware, meaning we can
    * add/remove streams at any point in time */
   gboolean streams_aware;
+
+  /* For eos handling */
+  gboolean state_quit;
+
+  /* For DLNA property */
+  guint32 dlna_opval;
+  /*for dlna slow forward stalling*/
+  guint32 dlna_flagval;
+  guint64 dlna_duration;
+  guint64 dlna_filelength;
+
+  /* For MHEG ICS property */
+  gboolean mheg_ics;
+
+  /* For HLS flag property */
+  gboolean real_time;
+
+  /* For duration calculation in push mode */
+  gint32 seen_pcr;
+
+  /* geunil.jung. For high speed trick */
+  guint16 video_pid;
+  gboolean iframe_push_done;
+  gboolean is_iframe_in_cur_pes;
+  gboolean high_speed_trick;
+  gboolean is_higher_than_FHD;
+  guint64 trick_seek_offset;
+  guint32 trick_seek_size;
+  guint32 iframe_interval;
+  guint64 iframe_offset;
+  guint64 prev_iframe_offset;
+  gboolean ignore_flush;
+  gint64 file_size;
+  gdouble scan_size_ratio;
+  gdouble seek_size_ratio;
+  gboolean happen_seek_event;
+
+  gboolean is_program_started;
+
+  /* For custom pipeline seek mode */
+  gboolean custom_seek_mode;
+  gboolean serverside_trick;
+
+  /*for DLNA time mode*/
+  guint64 curr_offset;
+  guint16 video_pcr_pid;
+  gboolean audio_pushed;
 };
 
-struct _MpegTSBaseClass {
+struct _MpegTSBaseClass
+{
   GstElementClass parent_class;
 
   /* Virtual methods */
@@ -174,7 +240,7 @@ struct _MpegTSBaseClass {
   gboolean (*push_event) (MpegTSBase *base, GstEvent * event);
 
   /* program_started gets called when program's pmt arrives for first time */
-  void (*program_started) (MpegTSBase *base, MpegTSBaseProgram *program);
+  void (*program_started) (MpegTSBase * base, MpegTSBaseProgram * program);
   /* program_stopped gets called when pat no longer has program's pmt */
   void (*program_stopped) (MpegTSBase *base, MpegTSBaseProgram *program);
   void (*update_program) (MpegTSBase *base, MpegTSBaseProgram *program);
@@ -186,7 +252,7 @@ struct _MpegTSBaseClass {
   /* stream_added is called whenever a new stream has been identified */
   gboolean (*stream_added) (MpegTSBase *base, MpegTSBaseStream *stream, MpegTSBaseProgram *program);
   /* stream_removed is called whenever a stream is no longer referenced */
-  void (*stream_removed) (MpegTSBase *base, MpegTSBaseStream *stream);
+  void (*stream_removed) (MpegTSBase * base, MpegTSBaseStream * stream);
 
   /* find_timestamps is called to find PCR */
   GstFlowReturn (*find_timestamps) (MpegTSBase * base, guint64 initoff, guint64 *offset);
@@ -211,27 +277,36 @@ struct _MpegTSBaseClass {
   void (*nit_info) (GstStructure *nit);
   void (*sdt_info) (GstStructure *sdt);
   void (*eit_info) (GstStructure *eit);
+
+  /* geunil.jung. For high speed trick */
+  void (*reset_stream) (MpegTSBase * base);
 };
 
 #define MPEGTS_BIT_SET(field, offs)    ((field)[(offs) >> 3] |=  (1 << ((offs) & 0x7)))
 #define MPEGTS_BIT_UNSET(field, offs)  ((field)[(offs) >> 3] &= ~(1 << ((offs) & 0x7)))
 #define MPEGTS_BIT_IS_SET(field, offs) ((field)[(offs) >> 3] &   (1 << ((offs) & 0x7)))
 
+#define ABS_M(a) (((a) > 0) ? (a) : -(a))
+
 G_GNUC_INTERNAL GType mpegts_base_get_type(void);
 
-G_GNUC_INTERNAL MpegTSBaseProgram *mpegts_base_get_program (MpegTSBase * base, gint program_number);
-G_GNUC_INTERNAL MpegTSBaseProgram *mpegts_base_add_program (MpegTSBase * base, gint program_number, guint16 pmt_pid);
+G_GNUC_INTERNAL MpegTSBaseProgram *mpegts_base_get_program (MpegTSBase * base,
+    gint program_number);
+G_GNUC_INTERNAL MpegTSBaseProgram *mpegts_base_add_program (MpegTSBase * base,
+    gint program_number, guint16 pmt_pid);
 
 G_GNUC_INTERNAL const GstMpegtsDescriptor *mpegts_get_descriptor_from_stream (MpegTSBaseStream * stream, guint8 tag);
 G_GNUC_INTERNAL const GstMpegtsDescriptor *mpegts_get_descriptor_from_program (MpegTSBaseProgram * program, guint8 tag);
 
+G_GNUC_INTERNAL const GstMpegtsDescriptor *mpegts_get_dvb_extension_descriptor_from_stream (MpegTSBaseStream * stream, guint8 tag, guint8 tag_extension);
+
 G_GNUC_INTERNAL gboolean
-mpegts_base_handle_seek_event(MpegTSBase * base, GstPad * pad, GstEvent * event);
+mpegts_base_handle_seek_event (MpegTSBase * base, GstPad * pad,
+    GstEvent * event);
 
 G_GNUC_INTERNAL gboolean gst_mpegtsbase_plugin_init (GstPlugin * plugin);
 
 G_GNUC_INTERNAL void mpegts_base_deactivate_and_free_program (MpegTSBase *base, MpegTSBaseProgram *program);
 
 G_END_DECLS
-
 #endif /* GST_MPEG_TS_BASE_H */

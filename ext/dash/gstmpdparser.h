@@ -240,6 +240,8 @@ struct _GstRepresentationBaseType
   GList *AudioChannelConfiguration;
   /* list of ContentProtection DescriptorType nodes */
   GList *ContentProtection;
+  /* list of InbandEventStream DescriptorType nodes */
+  GList *InbandEventStream;
 };
 
 struct _GstSubRepresentationNode
@@ -500,6 +502,7 @@ struct _GstActiveStream
   guint segment_repeat_index;                 /* index of the repeat count of a segment */
   GPtrArray *segments;                        /* array of GstMediaSegment */
   GstClockTime presentationTimeOffset;        /* presentation time offset of the current segment */
+  gboolean is_default;
 };
 
 struct _GstMpdClient
@@ -592,6 +595,11 @@ gboolean gst_mpd_client_get_video_stream_framerate (GstActiveStream * stream, gi
 guint gst_mpd_client_get_audio_stream_rate (GstActiveStream * stream);
 guint gst_mpd_client_get_audio_stream_num_channels (GstActiveStream * stream);
 
+/* Get audio/video stream max parameters */
+guint gst_mpd_client_get_video_stream_max_width (GstActiveStream * stream);
+guint gst_mpd_client_get_video_stream_max_height (GstActiveStream * stream);
+gboolean gst_mpd_client_get_video_stream_max_framerate (GstActiveStream * stream, gint * fps_num, gint * fps_den);
+
 /* Support multi language */
 guint gst_mpdparser_get_list_and_nb_of_audio_language (GstMpdClient *client, GList **lang);
 
@@ -602,7 +610,10 @@ gint64 gst_mpd_client_parse_default_presentation_delay(GstMpdClient * client, co
 /* profiles */
 gboolean gst_mpd_client_has_isoff_ondemand_profile (GstMpdClient *client);
 
+/* MPD Anchor */
+gboolean gst_mpd_client_parse_mpd_anchor (GstMpdClient * client, GstSegment * segment,
+    guint * period_idx);
+
 G_END_DECLS
 
 #endif /* __GST_MPDPARSER_H__ */
-

@@ -98,7 +98,7 @@ G_BEGIN_DECLS
 #define CLOCK_FREQ (CLOCK_BASE * 10000)   /* 90 kHz PTS clock */
 #define CLOCK_FREQ_SCR (CLOCK_FREQ * 300) /* 27 MHz SCR clock */
 
-#define GSTTIME_TO_MPEGTIME(time) \
+#define GSTTIME_TO_MPEGTIME_TSMUX(time) \
     (((time) > 0 ? (gint64) 1 : (gint64) -1) * \
     (gint64) gst_util_uint64_scale (ABS(time), CLOCK_BASE, GST_MSECOND/10))
 

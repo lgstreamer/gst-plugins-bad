@@ -500,7 +500,6 @@ dump_descriptors (GPtrArray * descriptors, guint spacing)
       case GST_MTS_DESC_REGISTRATION:
       {
         const guint8 *data = desc->data + 2;
-#define SAFE_CHAR(a) (g_ascii_isprint(a) ? a : '.')
         g_printf ("%*s   Registration : %c%c%c%c [%02x%02x%02x%02x]\n", spacing,
             "", SAFE_CHAR (data[0]), SAFE_CHAR (data[1]), SAFE_CHAR (data[2]),
             SAFE_CHAR (data[3]), data[0], data[1], data[2], data[3]);

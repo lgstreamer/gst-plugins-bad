@@ -603,10 +603,6 @@ gst_mss_demux_stream_select_bitrate (GstAdaptiveDemuxStream * stream,
   return ret;
 }
 
-#define SEEK_UPDATES_PLAY_POSITION(r, start_type, stop_type) \
-  ((r >= 0 && start_type != GST_SEEK_TYPE_NONE) || \
-   (r < 0 && stop_type != GST_SEEK_TYPE_NONE))
-
 static gboolean
 gst_mss_demux_seek (GstAdaptiveDemux * demux, GstEvent * seek)
 {
@@ -616,6 +612,9 @@ gst_mss_demux_seek (GstAdaptiveDemux * demux, GstEvent * seek)
   GstSeekType start_type, stop_type;
   gint64 start, stop;
   GstMssDemux *mssdemux = GST_MSS_DEMUX_CAST (demux);
+  GstClockTime target_pos;
+  GList *iter;
+  gboolean do_snapseek = FALSE;
 
   gst_event_parse_seek (seek, &rate, &format, &flags, &start_type, &start,
       &stop_type, &stop);
@@ -624,11 +623,39 @@ gst_mss_demux_seek (GstAdaptiveDemux * demux, GstEvent * seek)
       "seek event, rate: %f start: %" GST_TIME_FORMAT " stop: %"
       GST_TIME_FORMAT, rate, GST_TIME_ARGS (start), GST_TIME_ARGS (stop));
 
-  if (SEEK_UPDATES_PLAY_POSITION (rate, start_type, stop_type)) {
+  if (!SEEK_UPDATES_PLAY_POSITION (rate, start_type, stop_type))
+    return TRUE;
+
+  if (rate >= 0.0) {
+    target_pos = (GstClockTime) start;
+  } else {
+    target_pos = (GstClockTime) stop;
+  }
+
+  if (IS_SNAP_SEEK (flags))
+    do_snapseek = TRUE;
+
+  for (iter = demux->streams; iter; iter = g_list_next (iter)) {
+    GstAdaptiveDemuxStream *stream = (GstAdaptiveDemuxStream *) iter->data;
+
+    if (do_snapseek) {
+      GstClockTime final_ts;
+      gst_mss_demux_stream_seek (stream, rate >= 0, flags, target_pos,
+          &final_ts);
+      if (GST_CLOCK_TIME_IS_VALID (final_ts))
+        target_pos = final_ts;
+      do_snapseek = FALSE;
+    } else
+      gst_mss_demux_stream_seek (stream, rate >= 0, 0, target_pos, NULL);
+  }
+
+  if (IS_SNAP_SEEK (flags)) {
     if (rate >= 0)
-      gst_mss_manifest_seek (mssdemux->manifest, rate >= 0, start);
+      gst_segment_do_seek (&demux->segment, rate, format, flags, start_type,
+          target_pos, stop_type, stop, NULL);
     else
-      gst_mss_manifest_seek (mssdemux->manifest, rate >= 0, stop);
+      gst_segment_do_seek (&demux->segment, rate, format, flags, start_type,
+          start, stop_type, target_pos, NULL);
   }
 
   return TRUE;

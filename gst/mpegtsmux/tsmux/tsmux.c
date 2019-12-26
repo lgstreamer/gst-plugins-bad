@@ -111,7 +111,7 @@
 
 /* Base for all written PCR and DTS/PTS,
  * so we have some slack to go backwards */
-#define CLOCK_BASE (TSMUX_CLOCK_FREQ * 10 * 360)
+#define TSMUX_CLOCK_BASE (TSMUX_CLOCK_FREQ * 10 * 360)
 
 static gboolean tsmux_write_pat (TsMux * mux);
 static gboolean tsmux_write_pmt (TsMux * mux, TsMuxProgram * program);
@@ -1055,8 +1055,8 @@ tsmux_write_stream_packet (TsMux * mux, TsMuxStream * stream)
     /* FIXME: The current PCR needs more careful calculation than just
      * writing a fixed offset */
     if (cur_pts != G_MININT64) {
-      /* CLOCK_BASE >= TSMUX_PCR_OFFSET */
-      cur_pts += CLOCK_BASE;
+      /* TSMUX_CLOCK_BASE >= TSMUX_PCR_OFFSET */
+      cur_pts += TSMUX_CLOCK_BASE;
       cur_pcr = (cur_pts - TSMUX_PCR_OFFSET) *
           (TSMUX_SYS_CLOCK_FREQ / TSMUX_CLOCK_FREQ);
     }
@@ -1126,9 +1126,9 @@ tsmux_write_stream_packet (TsMux * mux, TsMuxStream * stream)
   if (pi->packet_start_unit_indicator) {
     tsmux_stream_initialize_pes_packet (stream);
     if (stream->dts != G_MININT64)
-      stream->dts += CLOCK_BASE;
+      stream->dts += TSMUX_CLOCK_BASE;
     if (stream->pts != G_MININT64)
-      stream->pts += CLOCK_BASE;
+      stream->pts += TSMUX_CLOCK_BASE;
   }
   pi->stream_avail = tsmux_stream_bytes_avail (stream);
 

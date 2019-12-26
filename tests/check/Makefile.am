@@ -210,10 +210,10 @@ else
 check_webrtc=
 endif
 
-if USE_MSDK
-check_msdk=elements/msdkh264enc
+if USE_CKDRM
+check_ckdrm = elements/ckdrm
 else
-check_msdk=
+check_ckdrm =
 endif
 
 VALGRIND_TO_FIX = \
@@ -269,6 +269,7 @@ check_PROGRAMS = \
 	elements/mpegtsmux \
 	elements/mpegvideoparse \
 	elements/mpeg4videoparse \
+	elements/multiappsrc \
 	elements/mxfdemux \
 	elements/mxfmux \
 	elements/netsim \
@@ -296,7 +297,7 @@ check_PROGRAMS = \
 	$(check_srtp) \
 	$(check_player) \
 	$(check_webrtc) \
-	$(check_msdk) \
+	$(check_ckdrm) \
 	$(EXPERIMENTAL_CHECKS)
 
 noinst_HEADERS = elements/mxfdemux.h libs/isoff.h
@@ -455,6 +456,12 @@ elements_assrender_LDADD = $(GST_PLUGINS_BASE_LIBS) $(GST_VIDEO_LIBS) -lgstapp-$
 elements_mpegtsmux_CFLAGS = $(GST_PLUGINS_BASE_CFLAGS) $(GST_BASE_CFLAGS) $(AM_CFLAGS)
 elements_mpegtsmux_LDADD = $(GST_PLUGINS_BASE_LIBS) $(GST_VIDEO_LIBS) $(GST_BASE_LIBS) $(LDADD)
 
+elements_multiappsrc_CFLAGS = \
+        $(GST_BASE_CFLAGS) $(AM_CFLAGS) $(GST_PLUGINS_BAD_CFLAGS)
+elements_multiappsrc_LDADD = \
+        $(top_builddir)/gst-libs/gst/multiapp/libgstmultiapp-@GST_API_VERSION@.la \
+        $(GST_BASE_LIBS) $(LDADD) -lgstapp-@GST_API_VERSION@
+
 elements_uvch264demux_CFLAGS = -DUVCH264DEMUX_DATADIR="$(srcdir)/elements/uvch264demux_data" \
 				$(AM_CFLAGS)
 
@@ -560,6 +567,8 @@ elements_hls_demux_LDADD = \
 	$(GST_PLUGINS_BASE_LIBS) -lgsttag-$(GST_API_VERSION) -lgstapp-$(GST_API_VERSION) \
 	$(GST_BASE_LIBS) $(LDADD)
 elements_hls_demux_SOURCES = elements/test_http_src.c elements/test_http_src.h elements/adaptive_demux_engine.c elements/adaptive_demux_engine.h elements/adaptive_demux_common.c elements/adaptive_demux_common.h elements/hls_demux.c
+
+elements_ckdrm_SOURCES = elements/ckdrm.c
 
 orc_compositor_CFLAGS = $(ORC_CFLAGS)
 orc_compositor_LDADD = $(ORC_LIBS) -lorc-test-0.4

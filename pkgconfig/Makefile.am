@@ -8,7 +8,8 @@ pcverfiles =  \
 	gstreamer-player-@GST_API_VERSION@.pc \
 	gstreamer-webrtc-@GST_API_VERSION@.pc \
 	gstreamer-bad-audio-@GST_API_VERSION@.pc \
-	gstreamer-bad-video-@GST_API_VERSION@.pc
+	gstreamer-bad-video-@GST_API_VERSION@.pc \
+	gstreamer-multiapp-@GST_API_VERSION@.pc
 
 pcverfiles_uninstalled = \
 	gstreamer-plugins-bad-@GST_API_VERSION@-uninstalled.pc \
@@ -18,7 +19,8 @@ pcverfiles_uninstalled = \
 	gstreamer-player-@GST_API_VERSION@-uninstalled.pc \
 	gstreamer-webrtc-@GST_API_VERSION@-uninstalled.pc \
 	gstreamer-bad-audio-@GST_API_VERSION@-uninstalled.pc \
-	gstreamer-bad-video-@GST_API_VERSION@-uninstalled.pc
+	gstreamer-bad-video-@GST_API_VERSION@-uninstalled.pc \
+	gstreamer-multiapp-@GST_API_VERSION@-uninstalled.pc
 
 all-local: $(pcverfiles) $(pcverfiles_uninstalled)
 
@@ -58,7 +60,8 @@ pcinfiles = \
            gstreamer-player.pc.in gstreamer-player-uninstalled.pc.in \
            gstreamer-webrtc.pc.in gstreamer-webrtc-uninstalled.pc.in \
            gstreamer-bad-audio.pc.in gstreamer-bad-audio-uninstalled.pc.in \
-           gstreamer-bad-video.pc.in gstreamer-bad-video-uninstalled.pc.in
+           gstreamer-bad-video.pc.in gstreamer-bad-video-uninstalled.pc.in \
+           gstreamer-multiapp.pc.in gstreamer-multiapp-uninstalled.pc.in
 
 DISTCLEANFILES = $(pcinfiles:.in=)
 EXTRA_DIST = $(pcinfiles)

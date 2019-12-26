@@ -43,8 +43,15 @@
 
 #define RUNNING_STATUS_RUNNING 4
 
+#define SEEK_TIMESTAMP_OFFSET (500 * GST_MSECOND)
+
 GST_DEBUG_CATEGORY_STATIC (mpegts_base_debug);
 #define GST_CAT_DEFAULT mpegts_base_debug
+
+//#define DUMP_TS_BASE
+#ifdef DUMP_TS_BASE
+FILE *dumpFp_tsbase = NULL;
+#endif
 
 static GQuark QUARK_PROGRAMS;
 static GQuark QUARK_PROGRAM_NUMBER;
@@ -91,6 +98,11 @@ static gboolean mpegts_base_parse_atsc_mgt (MpegTSBase * base,
     GstMpegtsSection * section);
 static gboolean remove_each_program (gpointer key, MpegTSBaseProgram * program,
     MpegTSBase * base);
+static gboolean mpegts_base_handle_seek_event_push_mode (MpegTSBase * base,
+    GstEvent * event);
+static void mpegts_base_chain_push_mode (MpegTSBase * base,
+    GstBuffer * buf, MpegTSPacketizer2 * packetizer);
+static gchar *_get_upstream_id (GstElement * element, GstPad * sinkpad);
 
 static void
 _extra_init (void)
@@ -207,6 +219,32 @@ mpegts_base_reset (MpegTSBase * base)
   base->seen_pat = FALSE;
   base->seek_offset = -1;
 
+  /* geunil.jung. For high speed trick */
+  base->video_pid = -1;
+  base->iframe_push_done = FALSE;
+  base->is_iframe_in_cur_pes = FALSE;
+  base->high_speed_trick = FALSE;
+  base->is_higher_than_FHD = FALSE;
+  base->trick_seek_offset = -1;
+  base->trick_seek_size = -1;
+  base->iframe_interval = -1;
+  base->iframe_offset = -1;
+  base->prev_iframe_offset = -1;
+  base->ignore_flush = FALSE;
+  base->file_size = -1;
+  base->scan_size_ratio = 1.0;
+  base->seek_size_ratio = 1.2;
+  base->happen_seek_event = FALSE;
+  base->is_program_started = FALSE;
+  base->video_pcr_pid = -1;
+  base->audio_pushed = FALSE;
+
+  base->file_size = -1;
+  base->is_program_started = FALSE;
+  base->curr_offset = -1;
+
+  base->serverside_trick = FALSE;
+
   g_hash_table_foreach_remove (base->programs, (GHRFunc) remove_each_program,
       base);
 
@@ -214,6 +252,9 @@ mpegts_base_reset (MpegTSBase * base)
       && GST_OBJECT_FLAG_IS_SET (GST_OBJECT_PARENT (base),
       GST_BIN_FLAG_STREAMS_AWARE);
   GST_DEBUG_OBJECT (base, "Streams aware : %d", base->streams_aware);
+
+  g_free (base->upstream_id);
+  base->upstream_id = _get_upstream_id ((GstElement *) base, base->sinkpad);
 
   if (klass->reset)
     klass->reset (base);
@@ -230,6 +271,8 @@ mpegts_base_init (MpegTSBase * base)
   gst_pad_set_event_function (base->sinkpad, mpegts_base_sink_event);
   gst_element_add_pad (GST_ELEMENT (base), base->sinkpad);
 
+  g_mutex_init (&base->expose_lock);
+
   base->disposed = FALSE;
   base->packetizer = mpegts_packetizer_new ();
   base->programs = g_hash_table_new_full (g_direct_hash, g_direct_equal,
@@ -243,8 +286,29 @@ mpegts_base_init (MpegTSBase * base)
 
   base->push_data = TRUE;
   base->push_section = TRUE;
+  base->seen_pcr = -1;
+
+  base->dlna_opval = DLNA_ORG_OP_INITIAL_VALUE;
+  base->dlna_flagval = 0x111;
+  base->dlna_duration = -1;
+  base->dlna_filelength = -1;
+
+  base->custom_seek_mode = FALSE;
+
+  base->mheg_ics = FALSE;
+
+  base->real_time = FALSE;
 
   mpegts_base_reset (base);
+
+#ifdef DUMP_TS_BASE
+  if (dumpFp_tsbase == NULL) {
+    dumpFp_tsbase = fopen ("/tmp/dump_tsbase.ts", "wb");
+    if (dumpFp_tsbase == NULL)
+      g_print
+          ("\n\n[#######################################DUMP_TS ] error file open\n\n");
+  }
+#endif
 }
 
 static void
@@ -258,6 +322,10 @@ mpegts_base_dispose (GObject * object)
     g_free (base->known_psi);
     g_free (base->is_pes);
   }
+
+  g_free (base->upstream_id);
+
+  g_mutex_clear (&base->expose_lock);
 
   if (G_OBJECT_CLASS (parent_class)->dispose)
     G_OBJECT_CLASS (parent_class)->dispose (object);
@@ -276,6 +344,13 @@ mpegts_base_finalize (GObject * object)
 
   if (G_OBJECT_CLASS (parent_class)->finalize)
     G_OBJECT_CLASS (parent_class)->finalize (object);
+
+#ifdef DUMP_TS_BASE
+  if (dumpFp_tsbase) {
+    fclose (dumpFp_tsbase);
+    dumpFp_tsbase = NULL;
+  }
+#endif
 }
 
 
@@ -291,6 +366,20 @@ mpegts_get_descriptor_from_stream (MpegTSBaseStream * stream, guint8 tag)
       tag, stream->pid, stream->stream_type);
 
   return gst_mpegts_find_descriptor (pmt->descriptors, tag);
+}
+
+const GstMpegtsDescriptor *
+mpegts_get_dvb_extension_descriptor_from_stream (MpegTSBaseStream * stream,
+    guint8 tag, guint8 tag_extension)
+{
+  GstMpegtsPMTStream *pmt = stream->stream;
+
+  GST_DEBUG
+      ("Searching for tag 0x%02x extenstion_tag 0x%02x in stream 0x%04x (stream_type 0x%02x)",
+      tag, tag_extension, stream->pid, stream->stream_type);
+
+  return gst_mpegts_find_dvb_extension_descriptor (pmt->descriptors, tag,
+      tag_extension);
 }
 
 typedef struct
@@ -373,12 +462,29 @@ _get_upstream_id (GstElement * element, GstPad * sinkpad)
   return upstream_id;
 }
 
+static gchar *
+_get_program_stream_id (MpegTSBase * base, gint program_number)
+{
+  gchar *stream_id, *ret;
+
+  if (G_UNLIKELY (base->upstream_id == NULL)) {
+    stream_id = _get_upstream_id ((GstElement *) base, base->sinkpad);
+  } else {
+    stream_id = g_strdup (base->upstream_id);
+  }
+
+  ret = g_strdup_printf ("%s:%d", stream_id, program_number);
+  g_free (stream_id);
+
+  return ret;
+}
+
 static MpegTSBaseProgram *
 mpegts_base_new_program (MpegTSBase * base,
     gint program_number, guint16 pmt_pid)
 {
   MpegTSBaseProgram *program;
-  gchar *upstream_id, *stream_id;
+  gchar *stream_id;
 
   GST_DEBUG_OBJECT (base, "program_number : %d, pmt_pid : %d",
       program_number, pmt_pid);
@@ -389,12 +495,12 @@ mpegts_base_new_program (MpegTSBase * base,
   program->pcr_pid = G_MAXUINT16;
   program->streams = g_new0 (MpegTSBaseStream *, 0x2000);
   program->patcount = 0;
+  program->video_num = 0;
+  program->is_valid_program = FALSE;
 
-  upstream_id = _get_upstream_id ((GstElement *) base, base->sinkpad);
-  stream_id = g_strdup_printf ("%s:%d", upstream_id, program_number);
+  stream_id = _get_program_stream_id (base, program_number);
   program->collection = gst_stream_collection_new (stream_id);
   g_free (stream_id);
-  g_free (upstream_id);
 
   return program;
 }
@@ -596,7 +702,7 @@ mpegts_base_program_remove_stream (MpegTSBase * base,
 }
 
 /* Check if pmtstream is already present in the program */
-static inline gboolean
+static inline GstMpegtsPMTStream *
 _stream_in_pmt (const GstMpegtsPMT * pmt, MpegTSBaseStream * stream)
 {
   guint i, nbstreams = pmt->streams->len;
@@ -606,10 +712,10 @@ _stream_in_pmt (const GstMpegtsPMT * pmt, MpegTSBaseStream * stream)
 
     if (pmt_stream->pid == stream->pid &&
         pmt_stream->stream_type == stream->stream_type)
-      return TRUE;
+      return pmt_stream;
   }
 
-  return FALSE;
+  return NULL;
 }
 
 static inline gboolean
@@ -627,14 +733,25 @@ mpegts_base_update_program (MpegTSBase * base, MpegTSBaseProgram * program,
     GstMpegtsSection * section, const GstMpegtsPMT * pmt)
 {
   MpegTSBaseClass *klass = GST_MPEGTS_BASE_GET_CLASS (base);
-  const gchar *stream_id =
-      gst_stream_collection_get_upstream_id (program->collection);
+  gchar *stream_id;
+  const gchar *oldstream_id;
   GstStreamCollection *collection;
-  GList *tmp, *toremove;
+  GList *tmp, *next, *toremove = NULL;
   guint i, nbstreams;
+  gboolean new_stream_id = FALSE;
+
+  stream_id = _get_program_stream_id (base, program->program_number);
+  oldstream_id = gst_stream_collection_get_upstream_id (program->collection);
+
+  if (!g_str_equal (stream_id, oldstream_id)) {
+    GST_DEBUG
+        ("Upstream id was changed, do not accept all streams in old program");
+    new_stream_id = TRUE;
+  }
 
   /* Create new collection */
   collection = gst_stream_collection_new (stream_id);
+  g_free (stream_id);
   gst_object_unref (program->collection);
   program->collection = collection;
 
@@ -643,12 +760,24 @@ mpegts_base_update_program (MpegTSBase * base, MpegTSBaseProgram * program,
   program->section = gst_mpegts_section_ref (section);
   program->pmt = pmt;
 
-  /* Copy over gststream that still exist into the collection */
-  for (tmp = program->stream_list; tmp; tmp = tmp->next) {
+  for (tmp = program->stream_list; tmp; tmp = next) {
     MpegTSBaseStream *stream = (MpegTSBaseStream *) tmp->data;
-    if (_stream_in_pmt (pmt, stream)) {
+    GstMpegtsPMTStream *pmt_stream = _stream_in_pmt (pmt, stream);
+
+    next = tmp->next;
+
+    if (pmt_stream && !new_stream_id) {
+      /* Copy over gststream that still exist into the collection */
       gst_stream_collection_add_stream (program->collection,
           gst_object_ref (stream->stream_object));
+
+      if (pmt_stream != stream->stream)
+        stream->stream = pmt_stream;
+    } else {
+      /* Remove old streams although pid and stream type are same */
+      toremove = g_list_prepend (toremove, stream);
+      program->streams[stream->pid] = NULL;
+      program->stream_list = g_list_remove_link (program->stream_list, tmp);
     }
   }
 
@@ -656,7 +785,7 @@ mpegts_base_update_program (MpegTSBase * base, MpegTSBaseProgram * program,
   nbstreams = pmt->streams->len;
   for (i = 0; i < nbstreams; i++) {
     GstMpegtsPMTStream *stream = g_ptr_array_index (pmt->streams, i);
-    if (!_pmt_stream_in_program (program, stream))
+    if (!_pmt_stream_in_program (program, stream) || new_stream_id)
       mpegts_base_program_add_stream (base, program, stream->pid,
           stream->stream_type, stream);
   }
@@ -665,8 +794,9 @@ mpegts_base_update_program (MpegTSBase * base, MpegTSBaseProgram * program,
   if (klass->update_program)
     klass->update_program (base, program);
 
+  gst_element_no_more_pads ((GstElement *) base);
+
   /* Remove streams no longer present */
-  toremove = NULL;
   for (tmp = program->stream_list; tmp; tmp = tmp->next) {
     MpegTSBaseStream *stream = (MpegTSBaseStream *) tmp->data;
     if (!_stream_in_pmt (pmt, stream))
@@ -674,7 +804,12 @@ mpegts_base_update_program (MpegTSBase * base, MpegTSBaseProgram * program,
   }
   for (tmp = toremove; tmp; tmp = tmp->next) {
     MpegTSBaseStream *stream = (MpegTSBaseStream *) tmp->data;
-    mpegts_base_program_remove_stream (base, program, stream->pid);
+    MpegTSBaseClass *klass = GST_MPEGTS_BASE_GET_CLASS (base);
+
+    if (!new_stream_id)
+      mpegts_base_program_remove_stream (base, program, stream->pid);
+    else if (klass->stream_removed)
+      klass->stream_removed (base, stream);
   }
   return TRUE;
 }
@@ -725,11 +860,10 @@ mpegts_base_is_same_program (MpegTSBase * base, MpegTSBaseProgram * oldprogram,
   }
 
   if (oldprogram->pcr_pid != new_pmt->pcr_pid) {
-    GST_DEBUG ("Different pcr_pid (new:0x%04x, old:0x%04x)",
+    GST_INFO ("Different pcr_pid (new:0x%04x, old:0x%04x)",
         new_pmt->pcr_pid, oldprogram->pcr_pid);
     return FALSE;
   }
-
   /* Check the streams */
   nbstreams = new_pmt->streams->len;
   for (i = 0; i < nbstreams; ++i) {
@@ -787,6 +921,15 @@ mpegts_base_is_program_update (MpegTSBase * base,
 {
   guint i, nbstreams;
   MpegTSBaseStream *oldstream;
+
+  if (base->upstream_id && oldprogram->collection) {
+    const gchar *upstream_id =
+        gst_stream_collection_get_upstream_id (oldprogram->collection);
+    if (!g_strrstr (upstream_id, base->upstream_id)) {
+      GST_DEBUG ("Upstream id was changed, do program update");
+      return TRUE;
+    }
+  }
 
   if (oldprogram->pmt_pid != new_pmt_pid) {
     /* FIXME/CHECK: Can a program be updated by just changing its PID
@@ -891,7 +1034,11 @@ mpegts_base_activate_program (MpegTSBase * base, MpegTSBaseProgram * program,
 
   program->pmt = pmt;
   program->pmt_pid = pmt_pid;
-  program->pcr_pid = pmt->pcr_pid;
+  /* Always use the first buffer's PTS as basetime */
+  if (base->real_time)
+    program->pcr_pid = 0x1fff;
+  else
+    program->pcr_pid = pmt->pcr_pid;
 
   /* extract top-level registration_id if present */
   program->registration_id =
@@ -929,7 +1076,8 @@ mpegts_base_activate_program (MpegTSBase * base, MpegTSBaseProgram * program,
   program->initial_program = initial_program;
 
   klass = GST_MPEGTS_BASE_GET_CLASS (base);
-  if (klass->program_started != NULL)
+  if (klass->program_started != NULL && pmt->streams->len > 0
+      && program->is_valid_program)
     klass->program_started (base, program);
 
   GST_DEBUG_OBJECT (base, "new pmt activated");
@@ -961,6 +1109,16 @@ mpegts_base_apply_pat (MpegTSBase * base, GstMpegtsSection * section)
   base->pat = pat;
 
   GST_LOG ("Activating new Program Association Table");
+
+  /* Check the PMT number. If the PMT is too much, then infinite loading occurs.
+   * We decided the compared number(15) by experience.
+   */
+  if (pat->len > 50) {
+    GST_ELEMENT_ERROR (base, STREAM, FAILED,
+        (_("This stream has so many PMTs.")),
+        ("parsing stopped, reason: This stream has so many PMTs. So return error."));
+  }
+
   /* activate the new table */
   for (i = 0; i < pat->len; ++i) {
     GstMpegtsPatProgram *patp = g_ptr_array_index (pat, i);
@@ -1071,6 +1229,14 @@ mpegts_base_apply_pmt (MpegTSBase * base, GstMpegtsSection * section)
   GST_DEBUG ("Applying PMT (program_number:%d, pid:0x%04x)",
       program_number, section->pid);
 
+  /* Send the message to Application. It's about audio number for MHEG. */
+  if (gst_element_post_message (GST_ELEMENT_CAST (base),
+          gst_message_new_application (GST_OBJECT_CAST (base),
+              gst_structure_new ("GstMessageAudio", "AUDIONUM", G_TYPE_INT,
+                  pmt->audio_number, NULL))))
+    GST_DEBUG ("Success to send application msg about audio number(%d).",
+        pmt->audio_number);
+
   /* In order for stream switching to happen properly in decodebin(2),
    * we need to first add the new pads (i.e. activate the new program)
    * before removing the old ones (i.e. deactivating the old program)
@@ -1080,11 +1246,13 @@ mpegts_base_apply_pmt (MpegTSBase * base, GstMpegtsSection * section)
   if (G_UNLIKELY (old_program == NULL))
     goto no_program;
 
-  if (base->streams_aware
+  if (base->real_time && base->streams_aware
       && mpegts_base_is_program_update (base, old_program, section->pid, pmt)) {
     GST_FIXME ("We are streams_aware and new program is an update");
+    g_mutex_lock (&base->expose_lock);
     /* The program is an update, and we can add/remove pads dynamically */
     mpegts_base_update_program (base, old_program, section, pmt);
+    g_mutex_unlock (&base->expose_lock);
     goto beach;
   }
 
@@ -1309,16 +1477,31 @@ mpegts_base_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
   MpegTSBase *base = GST_MPEGTS_BASE (parent);
   gboolean is_sticky = GST_EVENT_IS_STICKY (event);
 
-  GST_DEBUG_OBJECT (base, "Got event %s",
+  GST_INFO_OBJECT (base, "Got event %s",
       gst_event_type_get_name (GST_EVENT_TYPE (event)));
 
   switch (GST_EVENT_TYPE (event)) {
     case GST_EVENT_SEGMENT:
+    {
+      gdouble rate;
+      GST_DEBUG ("segment.rate = %f in sink_event", base->segment.rate);
+      rate = base->segment.rate;
       gst_event_copy_segment (event, &base->segment);
+      base->segment.rate = rate;
+
+      if (base->segment.format == GST_FORMAT_BYTES &&
+          base->segment.start != -1 && base->segment.start != base->seek_offset)
+        base->seek_offset = base->segment.start;
+
       GST_DEBUG_OBJECT (base, "Received segment %" GST_SEGMENT_FORMAT,
           &base->segment);
+
+      if (base->segment.format == GST_FORMAT_BYTES && base->segment.start != -1
+          && base->segment.start != base->seek_offset)
+        base->seek_offset = base->segment.start;
+
       /* Check if we need to switch PCR/PTS handling */
-      if (base->segment.format == GST_FORMAT_TIME) {
+      if (base->segment.format == GST_FORMAT_TIME && base->real_time) {
         base->packetizer->calculate_offset = FALSE;
         base->packetizer->calculate_skew = TRUE;
         /* Seek was handled upstream */
@@ -1330,20 +1513,58 @@ mpegts_base_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
 
       res = GST_MPEGTS_BASE_GET_CLASS (base)->push_event (base, event);
       break;
+    }
     case GST_EVENT_STREAM_START:
+    {
+      const gchar *upstream_id = NULL;
+
+      gst_event_parse_stream_start (event, &upstream_id);
+
+      g_free (base->upstream_id);
+      base->upstream_id = g_strdup (upstream_id);
       gst_event_unref (event);
+    }
+      break;
+    case GST_EVENT_EOS:
+      if (base->mode == BASE_MODE_SEEK_FOR_SCAN) {
+        gst_event_unref (event);
+        break;
+      }
+      res = GST_MPEGTS_BASE_GET_CLASS (base)->push_event (base, event);
+      if (!res) {
+        GST_ELEMENT_ERROR (base, STREAM, FAILED,
+            (_("Internal data stream error.")),
+            ("No program activated before EOS"));
+      }
       break;
     case GST_EVENT_CAPS:
       /* FIXME, do something */
       gst_event_unref (event);
       break;
     case GST_EVENT_FLUSH_STOP:
+      /* geunil.jung. For high speed trick */
+      if (base->ignore_flush) {
+        mpegts_packetizer_flush (base->packetizer, FALSE);
+        gst_event_unref (event);
+        return res;
+      }
       res = GST_MPEGTS_BASE_GET_CLASS (base)->push_event (base, event);
-      hard = (base->mode != BASE_MODE_SEEKING);
+      hard = FALSE;
       mpegts_packetizer_flush (base->packetizer, hard);
       mpegts_base_flush (base, hard);
       gst_segment_init (&base->segment, GST_FORMAT_UNDEFINED);
       base->seen_pat = FALSE;
+      break;
+      /* geunil.jung. For high speed trick */
+    case GST_EVENT_FLUSH_START:
+      if (base->ignore_flush == TRUE) {
+        gst_event_unref (event);
+        return res;
+      }
+
+      g_mutex_lock (&base->expose_lock);
+      res = GST_MPEGTS_BASE_GET_CLASS (base)->push_event (base, event);
+      g_mutex_unlock (&base->expose_lock);
       break;
     default:
       res = GST_MPEGTS_BASE_GET_CLASS (base)->push_event (base, event);
@@ -1356,6 +1577,159 @@ mpegts_base_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
   return res;
 }
 
+static gboolean
+scan_for_push (MpegTSBase * base)
+{
+  guint seen_pcr;
+  GstEvent *event;
+
+  /* if only time-based dlna, don't scan */
+  if (base->dlna_opval == DLNA_ORG_OP_TIME_RANGE
+      || base->dlna_opval == DLNA_ORG_OP_NONE) {
+    base->mode = BASE_MODE_PUSHING;
+    return FALSE;
+  }
+
+  if (base->file_size == -1) {
+    gst_pad_peer_query_duration (base->sinkpad, GST_FORMAT_BYTES,
+        &base->file_size);
+  }
+
+  if (base->file_size == -1) {
+    if (base->dlna_filelength != -1
+        && (base->dlna_opval & DLNA_ORG_OP_BYTE_RANGE))
+      base->file_size = base->dlna_filelength;
+    else {
+      /* if we could not obtain file size, then it is live. */
+      base->mode = BASE_MODE_PUSHING;
+      return FALSE;
+    }
+  }
+
+  seen_pcr = base->packetizer->nb_seen_offsets;
+
+  if (seen_pcr < 2)
+    return FALSE;
+
+  if (base->mode == BASE_MODE_SCANNING)
+    base->seen_pcr = seen_pcr;
+
+  /* if PMT is not parsed yet, do not scan */
+  if (!base->is_program_started) {
+    base->mode = BASE_MODE_PUSHING;
+    return FALSE;
+  }
+
+  if (base->mode == BASE_MODE_SCANNING) {
+    base->seek_offset = base->file_size - MAX (base->file_size / 10, 655360);
+
+    event = gst_event_new_seek (1, GST_FORMAT_BYTES,
+        GST_SEEK_FLAG_SKIP | GST_SEEK_FLAG_FLUSH,
+        GST_SEEK_TYPE_SET, base->seek_offset, GST_SEEK_TYPE_NONE, -1);
+
+    if (!gst_pad_push_event (base->sinkpad, event)) {
+      base->mode = BASE_MODE_PUSHING;
+      return FALSE;
+    }
+
+    base->mode = BASE_MODE_SEEK_FOR_SCAN;
+  } else {
+    if (seen_pcr > base->seen_pcr || base->seek_offset >= base->file_size) {
+      base->seek_offset = 0;
+      event = gst_event_new_seek (1, GST_FORMAT_BYTES,
+          GST_SEEK_FLAG_SKIP | GST_SEEK_FLAG_FLUSH,
+          GST_SEEK_TYPE_SET, base->seek_offset, GST_SEEK_TYPE_NONE, -1);
+
+      if (!gst_pad_push_event (base->sinkpad, event))
+        return FALSE;
+
+      base->mode = BASE_MODE_PUSHING;
+    } else
+      return FALSE;
+  }
+
+  return TRUE;
+}
+
+/*This function will handle the dlna (push) mode */
+static void
+mpegts_base_chain_push_mode (MpegTSBase * base, GstBuffer * buf,
+    MpegTSPacketizer2 * packetizer)
+{
+  GstEvent *event;
+  gint64 start_pos, trick_interval;
+  GstFormat format = GST_FORMAT_BYTES;
+  GstSeekFlags flags;
+
+  flags = (GST_SEEK_FLAG_SKIP | GST_SEEK_FLAG_FLUSH);
+
+  if (base->dlna_opval == DLNA_ORG_OP_TIME_RANGE) {
+    format = GST_FORMAT_TIME;
+    trick_interval = ABS_M (base->segment.rate) * GST_SECOND;
+
+    if (base->segment.rate < 0) {
+      start_pos = base->curr_offset;
+      base->curr_offset =
+          (start_pos > trick_interval) ? (start_pos - trick_interval) : 0;
+
+      if (base->curr_offset == 0) {
+        /* In time based reverse trickplay, we add the flag(GST_SEEK_FLAG_REW_EOS)
+         * in the GstEvent at start position of stream. */
+        flags |= GST_SEEK_FLAG_REW_EOS;
+      }
+    } else if (base->segment.rate == 4) {
+      start_pos = base->curr_offset;
+      start_pos += trick_interval;
+      base->curr_offset = start_pos;
+      /* validate start time before sending seek to upstream */
+      if (start_pos > base->dlna_duration)
+        return;
+    }
+  } else if (base->dlna_opval == DLNA_ORG_OP_BYTE_RANGE
+      || base->dlna_opval == DLNA_ORG_OP_BOTH_RANGE) {
+    if (base->segment.rate == 0.5) {
+      /*this change for mcvt seek */
+      guint64 offset;
+      start_pos = base->curr_offset + (GST_SECOND * 2);
+
+      offset = mpegts_packetizer_ts_to_offset (base->packetizer,
+          start_pos, base->video_pcr_pid);
+      if (start_pos < base->dlna_duration) {
+        event = gst_event_new_seek (1, GST_FORMAT_BYTES,
+            GST_SEEK_FLAG_SKIP | GST_SEEK_FLAG_FLUSH,
+            GST_SEEK_TYPE_SET, offset, GST_SEEK_TYPE_NONE, -1);
+        gst_pad_push_event (base->sinkpad, event);
+      }
+      base->curr_offset = start_pos;
+      return;
+    } else if ((base->segment.rate < 0 && base->audio_pushed)
+        || base->iframe_interval != -1) {
+      if (base->seek_offset != -1)
+        if (base->dlna_filelength != -1
+            && base->dlna_filelength > base->seek_offset)
+          base->curr_offset = base->seek_offset;
+        else
+          return;
+      else {
+        base->curr_offset = 0;
+        GST_MPEGTS_BASE_GET_CLASS (base)->push_event (base,
+            gst_event_new_eos ());
+        return;
+      }
+    } else
+      return;
+  }
+  if (base->audio_pushed)
+    base->audio_pushed = FALSE;
+  base->ignore_flush = TRUE;
+  event =
+      gst_event_new_seek (1, format, flags, GST_SEEK_TYPE_SET,
+      base->curr_offset, GST_SEEK_TYPE_NONE, -1);
+  if (event)
+    gst_pad_push_event (base->sinkpad, event);
+  return;
+}
+
 static GstFlowReturn
 mpegts_base_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
 {
@@ -1366,13 +1740,42 @@ mpegts_base_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
   MpegTSPacketizerPacket packet;
   MpegTSBaseClass *klass;
 
+#ifdef DUMP_TS_BASE
+  GstMapInfo info_org;
+  const guint8 *data;
+  guint size = 0;
+  gst_buffer_map (buf, &info_org, GST_MAP_READ);
+  data = info_org.data;
+  size = info_org.size;
+#endif
+
   base = GST_MPEGTS_BASE (parent);
   klass = GST_MPEGTS_BASE_GET_CLASS (base);
 
   packetizer = base->packetizer;
 
+  /* geunil.jung. For high speed trick */
+  if (base->seek_offset == -1)
+    base->seek_offset = 0;
+  base->seek_offset += gst_buffer_get_size (buf);
+
   if (klass->input_done)
     gst_buffer_ref (buf);
+
+#ifdef DUMP_TS_BASE
+  if (dumpFp_tsbase) {
+    size_t written = fwrite (data, sizeof (guint8), size, dumpFp_tsbase);
+    if (written != size)
+      printf
+          ("\n\n#######################################DUMP_TS ERROR : cannot write file \n\n");
+  }
+#endif
+
+  /* To calculate duration in push mode */
+  if (base->mode == BASE_MODE_SCANNING || base->mode == BASE_MODE_SEEK_FOR_SCAN) {
+    if (scan_for_push (base))
+      return GST_FLOW_OK;
+  }
 
   if (GST_BUFFER_IS_DISCONT (buf)) {
     GST_DEBUG_OBJECT (base, "Got DISCONT buffer, flushing");
@@ -1380,26 +1783,38 @@ mpegts_base_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
     if (G_UNLIKELY (res != GST_FLOW_OK))
       return res;
 
-    mpegts_base_flush (base, FALSE);
-    /* In the case of discontinuities in push-mode with TIME segment
-     * we want to drop all previous observations (hard:TRUE) from
-     * the packetizer */
-    if (base->mode == BASE_MODE_PUSHING
-        && base->segment.format == GST_FORMAT_TIME) {
-      mpegts_packetizer_flush (base->packetizer, TRUE);
-      mpegts_packetizer_clear (base->packetizer);
-    } else
-      mpegts_packetizer_flush (base->packetizer, FALSE);
+    if (!base->high_speed_trick) {
+      mpegts_base_flush (base, FALSE);
+      /* In the case of discontinuities in push-mode with TIME segment
+       * we want to drop all previous observations (hard:TRUE) from
+       * the packetizer */
+
+      /* FIXME : We are not used this case yet. This caused pcr reset
+       * so we cannot calculate PTS. But, we could need this futher.
+       * related case: Time based SEEK */
+      if (base->real_time && base->mode == BASE_MODE_PUSHING
+          && base->segment.format == GST_FORMAT_TIME) {
+        mpegts_packetizer_flush (base->packetizer, TRUE);
+        mpegts_packetizer_clear (base->packetizer);
+      } else
+        mpegts_packetizer_flush (base->packetizer, FALSE);
+    }
   }
 
   mpegts_packetizer_push (base->packetizer, buf);
+
+  if (base->packetizer->offset == -1)
+    base->packetizer->offset = base->seek_offset - gst_buffer_get_size (buf);
 
   while (res == GST_FLOW_OK) {
     pret = mpegts_packetizer_next_packet (base->packetizer, &packet);
 
     /* If we don't have enough data, return */
-    if (G_UNLIKELY (pret == PACKET_NEED_MORE))
+    if (G_UNLIKELY (pret == PACKET_NEED_MORE)) {
+      GST_DEBUG_OBJECT (base, "PACKET_NEED_MORE seek_offset %" G_GUINT64_FORMAT,
+          base->seek_offset);
       break;
+    }
 
     if (G_UNLIKELY (pret == PACKET_BAD)) {
       /* bad header, skip the packet */
@@ -1413,7 +1828,8 @@ mpegts_base_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
     /* If it's a known PES, push it */
     if (MPEGTS_BIT_IS_SET (base->is_pes, packet.pid)) {
       /* push the packet downstream */
-      if (base->push_data)
+      if (base->push_data && (base->mode == BASE_MODE_PUSHING
+              || base->mode == BASE_MODE_STREAMING))
         res = klass->push (base, &packet, NULL);
     } else if (packet.payload
         && MPEGTS_BIT_IS_SET (base->known_psi, packet.pid)) {
@@ -1431,7 +1847,8 @@ mpegts_base_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
       }
 
       /* we need to push section packet downstream */
-      if (base->push_section)
+      if (base->push_section && (base->mode == BASE_MODE_PUSHING
+              || base->mode == BASE_MODE_STREAMING))
         res = klass->push (base, &packet, section);
 
     } else if (packet.payload && packet.pid != 0x1fff)
@@ -1439,8 +1856,107 @@ mpegts_base_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
 
   next:
     mpegts_packetizer_clear_packet (base->packetizer, &packet);
+
+    /* geunil.jung. For high speed trick */
+    if (base->high_speed_trick && base->iframe_push_done && base->audio_pushed)
+      break;
   }
 
+  /* geunil.jung. For high speed trick */
+  if (res != GST_FLOW_OK && res != GST_FLOW_EOS)
+    goto done;
+
+  if (base->mode == BASE_MODE_PUSHING &&
+      (base->segment.rate == 0.5 && (base->dlna_opval == DLNA_ORG_OP_BYTE_RANGE
+              || base->dlna_opval == DLNA_ORG_OP_BOTH_RANGE))) {
+    mpegts_base_chain_push_mode (base, buf, packetizer);
+  }
+
+
+  if (base->high_speed_trick) {
+    if ((base->iframe_push_done && base->audio_pushed) ||
+        (base->segment.rate < 0 &&
+            base->seek_offset >= base->trick_seek_offset +
+            (base->trick_seek_size * base->scan_size_ratio) &&
+            (!base->is_iframe_in_cur_pes ||
+                base->prev_iframe_offset == base->iframe_offset))) {
+
+      GST_DEBUG
+          ("Input : segment.rate %f, iframe_interval %" G_GUINT32_FORMAT
+          ", iframe_offset %" G_GUINT64_FORMAT ", prev_iframe_offset %"
+          G_GUINT64_FORMAT ", trick_seek_size %" G_GUINT32_FORMAT
+          ", trick_seek_offset %" G_GUINT64_FORMAT ", seek_offset %"
+          G_GUINT64_FORMAT ", is_iframe_in_cur_pes %d", base->segment.rate,
+          base->iframe_interval, base->iframe_offset, base->prev_iframe_offset,
+          base->trick_seek_size, base->trick_seek_offset, base->seek_offset,
+          base->is_iframe_in_cur_pes);
+
+      /* check whether trick_seek_size is decided or not.
+       * if trick_seek_size is not decided yet,
+       * trick_seek_size should be decided.
+       */
+      if (base->iframe_push_done && base->iframe_interval == -1) {
+        if (base->prev_iframe_offset == -1) {
+          base->prev_iframe_offset = base->iframe_offset;
+        } else {
+          base->iframe_interval =
+              ABS_M (base->prev_iframe_offset - base->iframe_offset);
+          base->trick_seek_size = base->iframe_interval * base->seek_size_ratio;
+        }
+      }
+
+      /* work around for MPEG_TS_SD_NA when iframe_interval is very less */
+      if (base->dlna_opval == DLNA_ORG_OP_BYTE_RANGE && base->high_speed_trick
+          && base->iframe_interval == 13056) {
+        //base->iframe_interval = 600000;
+        base->trick_seek_size = 600000 * base->seek_size_ratio;
+      }
+
+      /* now set previous offset to jump */
+      if (base->segment.rate < 0 && base->trick_seek_offset <= 0) {
+        base->trick_seek_offset = -1;
+      } else if (base->segment.rate < 0 &&
+          base->trick_seek_offset <= base->trick_seek_size) {
+        base->trick_seek_offset = 0;
+      } else {
+        if (base->iframe_push_done && base->iframe_interval != -1
+            && base->prev_iframe_offset != base->iframe_offset)
+          base->trick_seek_offset = base->iframe_offset;
+
+        if (base->segment.rate < 0)
+          base->trick_seek_offset -= base->trick_seek_size;
+        else
+          base->trick_seek_offset += base->trick_seek_size;
+      }
+
+      if (base->segment.rate < 0 || base->iframe_interval != -1)
+        base->seek_offset = base->trick_seek_offset;
+
+      if (base->iframe_interval != -1)
+        base->prev_iframe_offset = base->iframe_offset;
+
+      base->iframe_push_done = FALSE;
+      base->is_iframe_in_cur_pes = FALSE;
+
+      GST_DEBUG
+          ("Output: segment.rate %f, iframe_interval %" G_GUINT32_FORMAT
+          ", iframe_offset %" G_GUINT64_FORMAT ", prev_iframe_offset %"
+          G_GUINT64_FORMAT ", trick_seek_size %" G_GUINT32_FORMAT
+          ", trick_seek_offset %" G_GUINT64_FORMAT ", seek_offset %"
+          G_GUINT64_FORMAT ", is_iframe_in_cur_pes %d", base->segment.rate,
+          base->iframe_interval, base->iframe_offset, base->prev_iframe_offset,
+          base->trick_seek_size, base->trick_seek_offset, base->seek_offset,
+          base->is_iframe_in_cur_pes);
+      if (base->mode == BASE_MODE_PUSHING) {
+        mpegts_base_chain_push_mode (base, buf, packetizer);
+      }
+      mpegts_packetizer_flush (packetizer, FALSE);
+      if (klass->reset_stream)
+        klass->reset_stream (base);
+    }
+  }
+
+done:
   if (klass->input_done) {
     if (res == GST_FLOW_OK)
       res = klass->input_done (base, buf);
@@ -1467,7 +1983,7 @@ mpegts_base_scan (MpegTSBase * base)
   GST_DEBUG ("Scanning for initial sync point");
 
   /* Find initial sync point and at least 5 PCR values */
-  for (i = 0; i < 20 && !done; i++) {
+  for (i = 0; i < 50 && !done; i++) {
     GST_DEBUG ("Grabbing %d => %d", i * 65536, (i + 1) * 65536);
 
     ret = gst_pad_pull_range (base->sinkpad, i * 65536, 65536, &buf);
@@ -1514,10 +2030,8 @@ mpegts_base_scan (MpegTSBase * base)
     goto beach;
   upstream_size = tmpval;
 
-  /* The scanning takes place on the last 2048kB. Considering PCR should
-   * be present at least every 100ms, this should cope with streams
-   * up to 160Mbit/s */
-  reverse_limit = MAX (0, upstream_size - 2097152);
+  /* The scanning takes place from file end in reverse order till a PCR is found  */
+  reverse_limit = 0;
 
   /* Find last PCR value, searching backwards by chunks of 300 MPEG-ts packets */
   for (seek_pos = MAX (0, upstream_size - 56400);
@@ -1557,7 +2071,7 @@ beach:
 no_initial_pcr:
   mpegts_packetizer_clear (base->packetizer);
   GST_WARNING_OBJECT (base, "Couldn't find any PCR within the first %d bytes",
-      10 * 65536);
+      50 * 65536);
   return GST_FLOW_OK;
 }
 
@@ -1594,7 +2108,10 @@ mpegts_base_loop (MpegTSBase * base)
           100 * base->packetsize, &buf);
       if (G_UNLIKELY (ret != GST_FLOW_OK))
         goto error;
-      base->seek_offset += gst_buffer_get_size (buf);
+
+      /* geunil.jung. For high speed trick */
+      // base->seek_offset += gst_buffer_get_size (buf);
+
       ret = mpegts_base_chain (base->sinkpad, GST_OBJECT_CAST (base), buf);
       if (G_UNLIKELY (ret != GST_FLOW_OK))
         goto error;
@@ -1602,6 +2119,9 @@ mpegts_base_loop (MpegTSBase * base)
       break;
     case BASE_MODE_PUSHING:
       GST_WARNING ("wrong BASE_MODE_PUSHING mode in pull loop");
+      break;
+    default:
+      GST_WARNING ("not handled mode");
       break;
   }
 
@@ -1624,6 +2144,112 @@ error:
   }
 }
 
+/*This function will handle the seek event in time based (Push) mode*/
+gboolean
+mpegts_base_handle_seek_event_push_mode (MpegTSBase * base, GstEvent * event)
+{
+  MpegTSBaseClass *klass = GST_MPEGTS_BASE_GET_CLASS (base);
+  GstFlowReturn ret = GST_FLOW_ERROR;
+  gdouble rate;
+  GstFormat format;
+  GstSeekFlags flags;
+  GstSeekType start_type, stop_type;
+  gint64 start, stop;
+
+  gst_event_parse_seek (event, &rate, &format, &flags, &start_type, &start,
+      &stop_type, &stop);
+
+  if (base->dlna_opval == DLNA_ORG_OP_TIME_RANGE && rate < 0) {
+    GstEvent *new_seek;
+    base->ignore_flush = FALSE;
+    base->curr_offset =
+        (stop > SEEK_TIMESTAMP_OFFSET) ? (stop - SEEK_TIMESTAMP_OFFSET) : stop;
+    base->high_speed_trick = TRUE;
+    base->happen_seek_event = TRUE;
+    base->seek_size_ratio = 1.2;
+    base->segment.rate = rate;
+
+    new_seek =
+        gst_event_new_seek (1, GST_FORMAT_TIME, flags,
+        GST_SEEK_TYPE_SET, base->curr_offset, GST_SEEK_TYPE_NONE, -1);
+
+    gst_event_set_seqnum (new_seek, GST_EVENT_SEQNUM (event));
+
+    if (gst_pad_push_event (base->sinkpad, new_seek)) {
+      base->segment.rate = rate;
+      base->last_seek_seqnum = GST_EVENT_SEQNUM (event);
+      return TRUE;
+    }
+  } else {
+    GstEvent *new_evt = NULL;
+    /* for DLNA time mode FF 4x in I frame mode */
+    if (base->dlna_opval == DLNA_ORG_OP_TIME_RANGE && rate > 2)
+      base->high_speed_trick = TRUE;
+    else if (base->dlna_opval == DLNA_ORG_OP_TIME_RANGE && rate == 2
+        && base->is_higher_than_FHD)
+      base->high_speed_trick = TRUE;
+    /* For time mode fast forward the seek_duration variable is set to start */
+    base->curr_offset = start;
+
+    if (base->dlna_opval == DLNA_ORG_OP_INITIAL_VALUE && rate < 0) {
+      new_evt =
+          gst_event_new_seek (1, format, flags, start_type, start, stop_type,
+          stop);
+      gst_event_set_seqnum (new_evt, GST_EVENT_SEQNUM (event));
+      gst_event_replace (&event, NULL);
+      event = new_evt;
+    }
+    /* First try if upstream supports seeking in TIME format */
+    if (gst_pad_push_event (base->sinkpad, gst_event_ref (event))) {
+      base->segment.rate = rate;
+      GST_INFO ("upstream handled SEEK event");
+      if (base->dlna_opval == DLNA_ORG_OP_INITIAL_VALUE && !base->real_time) {
+        base->custom_seek_mode = TRUE;
+        if (flags & GST_SEEK_FLAG_TRICKMODE)
+          base->serverside_trick = TRUE;
+      }
+      return TRUE;
+    }
+  }
+
+  /* If the subclass can seek, do that */
+  if (klass->seek) {
+    ret = klass->seek (base, event);
+    if (G_UNLIKELY (ret != GST_FLOW_OK))
+      GST_WARNING ("seeking failed %s", gst_flow_get_name (ret));
+    else {
+      GstEvent *new_seek;
+
+      if (base->dlna_opval == DLNA_ORG_OP_NONE && base->dlna_flagval == 0x1000) {
+        base->segment.rate = rate;
+        base->happen_seek_event = TRUE;
+        GST_DEBUG ("seek event, rate: %f start: %" GST_TIME_FORMAT
+            " stop: %" GST_TIME_FORMAT, rate, GST_TIME_ARGS (start),
+            GST_TIME_ARGS (stop));
+        return ret == GST_FLOW_OK;
+      }
+
+      base->curr_offset = start;
+      base->mode = BASE_MODE_SEEKING;
+
+      new_seek =
+          gst_event_new_seek ((rate < 0) ? 1 : rate, GST_FORMAT_BYTES, flags,
+          GST_SEEK_TYPE_SET, base->seek_offset, GST_SEEK_TYPE_NONE, -1);
+      gst_event_set_seqnum (new_seek, GST_EVENT_SEQNUM (event));
+      if (!gst_pad_push_event (base->sinkpad, new_seek))
+        ret = GST_FLOW_ERROR;
+      else
+        base->last_seek_seqnum = GST_EVENT_SEQNUM (event);
+      base->mode = BASE_MODE_PUSHING;
+    }
+  }
+
+  /* geunil.jung. For high speed trick */
+  base->segment.rate = rate;
+  base->happen_seek_event = TRUE;
+
+  return ret == GST_FLOW_OK;
+}
 
 gboolean
 mpegts_base_handle_seek_event (MpegTSBase * base, GstPad * pad,
@@ -1642,6 +2268,11 @@ mpegts_base_handle_seek_event (MpegTSBase * base, GstPad * pad,
   gst_event_parse_seek (event, &rate, &format, &flags, &start_type, &start,
       &stop_type, &stop);
 
+  GST_INFO ("seek event: rate %g, format %s, start %" GST_TIME_FORMAT ", stop %"
+      GST_TIME_FORMAT ", flag %d, start_type %d, stop_type %d", rate,
+      gst_format_get_name (format), GST_TIME_ARGS (start), GST_TIME_ARGS (stop),
+      flags, start_type, stop_type);
+
   if (format != GST_FORMAT_TIME)
     return FALSE;
 
@@ -1649,48 +2280,16 @@ mpegts_base_handle_seek_event (MpegTSBase * base, GstPad * pad,
     GST_DEBUG_OBJECT (base, "Skipping already handled seek");
     return TRUE;
   }
-
+  /*for DLNA time mode rewind */
+  base->high_speed_trick = FALSE;
+  base->ignore_flush = FALSE;
   if (base->mode == BASE_MODE_PUSHING) {
-    /* First try if upstream supports seeking in TIME format */
-    if (gst_pad_push_event (base->sinkpad, gst_event_ref (event))) {
-      GST_DEBUG ("upstream handled SEEK event");
-      return TRUE;
-    }
-
-    /* If the subclass can seek, do that */
-    if (klass->seek) {
-      ret = klass->seek (base, event);
-      if (G_UNLIKELY (ret != GST_FLOW_OK))
-        GST_WARNING ("seeking failed %s", gst_flow_get_name (ret));
-      else {
-        GstEvent *new_seek;
-
-        if (GST_CLOCK_TIME_IS_VALID (base->seek_offset)) {
-          base->mode = BASE_MODE_SEEKING;
-          new_seek = gst_event_new_seek (rate, GST_FORMAT_BYTES, flags,
-              GST_SEEK_TYPE_SET, base->seek_offset, GST_SEEK_TYPE_NONE, -1);
-          gst_event_set_seqnum (new_seek, GST_EVENT_SEQNUM (event));
-          if (!gst_pad_push_event (base->sinkpad, new_seek))
-            ret = GST_FLOW_ERROR;
-          else
-            base->last_seek_seqnum = GST_EVENT_SEQNUM (event);
-        }
-        base->mode = BASE_MODE_PUSHING;
-      }
-    } else {
-      GST_WARNING ("subclass has no seek implementation");
-    }
-
-    return ret == GST_FLOW_OK;
+    ret = mpegts_base_handle_seek_event_push_mode (base, event);
+    return ret;
   }
 
   if (!klass->seek) {
     GST_WARNING ("subclass has no seek implementation");
-    return FALSE;
-  }
-
-  if (rate <= 0.0) {
-    GST_WARNING ("Negative rate not supported");
     return FALSE;
   }
 
@@ -1728,12 +2327,6 @@ mpegts_base_handle_seek_event (MpegTSBase * base, GstPad * pad,
     mpegts_packetizer_flush (base->packetizer, FALSE);
   }
 
-  if (flags & (GST_SEEK_FLAG_SEGMENT)) {
-    GST_WARNING ("seek flags 0x%x are not supported", (int) flags);
-    goto done;
-  }
-
-
   /* If the subclass can seek, do that */
   ret = klass->seek (base, event);
   if (G_UNLIKELY (ret != GST_FLOW_OK))
@@ -1747,9 +2340,10 @@ mpegts_base_handle_seek_event (MpegTSBase * base, GstPad * pad,
     GST_MPEGTS_BASE_GET_CLASS (base)->push_event (base, flush_event);
     flush_event = NULL;
   }
-done:
-  if (flush_event)
-    gst_event_unref (flush_event);
+
+  /* geunil.jung. For high speed trick */
+  base->segment.rate = rate;
+  base->happen_seek_event = TRUE;
   gst_pad_start_task (base->sinkpad, (GstTaskFunction) mpegts_base_loop, base,
       NULL);
 
@@ -1797,7 +2391,15 @@ mpegts_base_sink_activate_mode (GstPad * pad, GstObject * parent,
 
   switch (mode) {
     case GST_PAD_MODE_PUSH:
-      base->mode = BASE_MODE_PUSHING;
+      if (base->dlna_opval == DLNA_ORG_OP_TIME_RANGE
+          || base->dlna_opval == DLNA_ORG_OP_NONE || base->mheg_ics)
+        base->mode = BASE_MODE_PUSHING;
+      else
+        base->mode = BASE_MODE_SCANNING;
+      if (!base->real_time) {
+        base->packetizer->calculate_offset = TRUE;
+        base->packetizer->calculate_skew = FALSE;
+      }
       res = TRUE;
       break;
     case GST_PAD_MODE_PULL:

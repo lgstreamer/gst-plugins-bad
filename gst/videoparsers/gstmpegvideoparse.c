@@ -880,6 +880,8 @@ gst_mpegv_parse_update_src_caps (GstMpegvParse * mpvparse)
     gst_caps_set_simple (caps, "interlace-mode",
         G_TYPE_STRING,
         (mpvparse->sequenceext.progressive ? "progressive" : "mixed"), NULL);
+    gst_caps_set_simple (caps, "Scan_Type", G_TYPE_UINT,
+        (mpvparse->sequenceext.progressive ? 0 : 1), NULL);
   }
 
   gst_pad_set_caps (GST_BASE_PARSE_SRC_PAD (mpvparse), caps);

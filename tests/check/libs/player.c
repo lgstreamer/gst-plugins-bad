@@ -383,15 +383,35 @@ uri_loaded_cb (GstPlayer * player, const gchar * uri, TestPlayerState * state)
   state->test_callback (player, STATE_CHANGE_URI_LOADED, &old_state, state);
 }
 
+static void
+element_msg_cb (GstPlayer * player, GstMessage * msg, TestPlayerState * state)
+{
+  GST_INFO ("Got element message");
+}
+
+static void
+application_msg_cb (GstPlayer * player, GstMessage * msg,
+    TestPlayerState * state)
+{
+  GST_INFO ("Got application message");
+}
+
 static GstPlayer *
-test_player_new (TestPlayerState * state)
+test_player_new_internal (TestPlayerState * state, gboolean use_default_context)
 {
   GstPlayer *player;
   GstElement *playbin, *fakesink;
 
-  player =
-      gst_player_new (NULL,
-      gst_player_g_main_context_signal_dispatcher_new (NULL));
+  if (use_default_context) {
+    player =
+        gst_player_new_with_default_context (NULL,
+        gst_player_g_main_context_signal_dispatcher_new (NULL));
+  } else {
+    player =
+        gst_player_new (NULL,
+        gst_player_g_main_context_signal_dispatcher_new (NULL));
+  }
+
   fail_unless (player != NULL);
 
   test_player_state_reset (state);
@@ -422,8 +442,24 @@ test_player_new (TestPlayerState * state)
       G_CALLBACK (video_dimensions_changed_cb), state);
   g_signal_connect (player, "seek-done", G_CALLBACK (seek_done_cb), state);
   g_signal_connect (player, "uri-loaded", G_CALLBACK (uri_loaded_cb), state);
+  g_signal_connect (player, "element-message",
+      G_CALLBACK (element_msg_cb), state);
+  g_signal_connect (player, "application-message",
+      G_CALLBACK (application_msg_cb), state);
 
   return player;
+}
+
+static GstPlayer *
+test_player_new (TestPlayerState * state)
+{
+  return test_player_new_internal (state, FALSE);
+}
+
+static GstPlayer *
+test_player_new_with_default_context (TestPlayerState * state)
+{
+  return test_player_new_internal (state, TRUE);
 }
 
 static void
@@ -1680,6 +1716,38 @@ START_TEST (test_user_agent)
 
 END_TEST;
 
+START_TEST (test_play_with_defualt_context)
+{
+  GstPlayer *player;
+  TestPlayerState state;
+  gchar *uri;
+
+  memset (&state, 0, sizeof (state));
+  state.loop = g_main_loop_new (NULL, FALSE);
+  state.test_callback = test_play_audio_video_eos_cb;
+  state.test_data = GINT_TO_POINTER (0x10);
+
+  player = test_player_new_with_default_context (&state);
+
+  fail_unless (player != NULL);
+
+  uri = gst_filename_to_uri (TEST_PATH "/audio-video-short.ogg", NULL);
+  fail_unless (uri != NULL);
+  gst_player_set_uri (player, uri);
+  g_free (uri);
+
+  gst_player_play (player);
+  g_main_loop_run (state.loop);
+
+  fail_unless_equals_int (GPOINTER_TO_INT (state.test_data) & (~0x10), 9);
+
+  stop_player (player, &state);
+  g_object_unref (player);
+  g_main_loop_unref (state.loop);
+}
+
+END_TEST;
+
 static Suite *
 player_suite (void)
 {
@@ -1723,6 +1791,7 @@ player_suite (void)
   tcase_add_test (tc_general, test_play_audio_video_seek_done);
   tcase_add_test (tc_general, test_restart);
   tcase_add_test (tc_general, test_user_agent);
+  tcase_add_test (tc_general, test_play_with_defualt_context);
 
   suite_add_tcase (s, tc_general);
 

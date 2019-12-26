@@ -416,6 +416,8 @@ static void gst_dash_demux_stream_free (GstAdaptiveDemuxStream * stream);
 
 static GstCaps *gst_dash_demux_get_input_caps (GstDashDemux * demux,
     GstActiveStream * stream);
+static void gst_dash_demux_set_stream_type (GstDashDemux * demux,
+    GstDashDemuxStream * stream, GstCaps * caps);
 static GstPad *gst_dash_demux_create_pad (GstDashDemux * demux,
     GstActiveStream * stream);
 static GstDashDemuxClockDrift *gst_dash_demux_clock_drift_new (GstDashDemux *
@@ -773,6 +775,7 @@ static gboolean
 gst_dash_demux_setup_all_streams (GstDashDemux * demux)
 {
   guint i;
+  guint n_audio = 0, n_video = 0, n_text = 0;
 
   GST_DEBUG_OBJECT (demux, "Setting up streams for period %d",
       gst_mpd_client_get_period_index (demux->client));
@@ -793,6 +796,8 @@ gst_dash_demux_setup_all_streams (GstDashDemux * demux)
     GstPad *srcpad;
     gchar *lang = NULL;
     GstTagList *tags = NULL;
+    guint *n_stream;
+    GstStreamFlags flags = GST_STREAM_FLAG_NONE;
 
     active_stream = gst_mpdparser_get_active_stream_by_index (demux->client, i);
     if (active_stream == NULL)
@@ -810,6 +815,22 @@ gst_dash_demux_setup_all_streams (GstDashDemux * demux)
       continue;
 
     caps = gst_dash_demux_get_input_caps (demux, active_stream);
+
+    switch (active_stream->mimeType) {
+      case GST_STREAM_AUDIO:
+        n_stream = &n_audio;
+        break;
+      case GST_STREAM_VIDEO:
+        n_stream = &n_video;
+        break;
+      default:
+        n_stream = &n_text;
+        break;
+    }
+
+    gst_caps_set_simple (caps, "track-id", G_TYPE_UINT, *n_stream, NULL);
+    *n_stream += 1;
+
     GST_LOG_OBJECT (demux, "Creating stream %d %" GST_PTR_FORMAT, i, caps);
 
     if (active_stream->cur_adapt_set) {
@@ -843,15 +864,27 @@ gst_dash_demux_setup_all_streams (GstDashDemux * demux)
     s = gst_caps_get_structure (caps, 0);
     stream->allow_sidx =
         gst_mpd_client_has_isoff_ondemand_profile (demux->client);
-    stream->is_isobmff = gst_structure_has_name (s, "video/quicktime")
-        || gst_structure_has_name (s, "audio/x-m4a");
+    stream->is_isobmff =
+        gst_structure_has_name (s, "video/quicktime") ||
+        gst_structure_has_name (s, "audio/x-m4a") ||
+        gst_structure_has_name (s, "application/x-3gp");
     stream->first_sync_sample_always_after_moof = TRUE;
     stream->adapter = gst_adapter_new ();
+    gst_dash_demux_set_stream_type (demux, stream, caps);
     gst_adaptive_demux_stream_set_caps (GST_ADAPTIVE_DEMUX_STREAM_CAST (stream),
         caps);
-    if (tags)
+    gst_caps_unref (caps);
+    if (active_stream->is_default)
+      flags = GST_STREAM_FLAG_SELECT;
+    if (active_stream->mimeType == GST_STREAM_APPLICATION)
+      flags |= GST_STREAM_FLAG_SPARSE;
+    gst_adaptive_demux_stream_set_stream_flags
+        (GST_ADAPTIVE_DEMUX_STREAM_CAST (stream), flags);
+    if (tags) {
       gst_adaptive_demux_stream_set_tags (GST_ADAPTIVE_DEMUX_STREAM_CAST
           (stream), tags);
+      gst_tag_list_unref (tags);
+    }
     stream->index = i;
     stream->pending_seek_ts = GST_CLOCK_TIME_NONE;
     stream->sidx_position = GST_CLOCK_TIME_NONE;
@@ -866,6 +899,14 @@ gst_dash_demux_setup_all_streams (GstDashDemux * demux)
       g_list_foreach (active_stream->cur_adapt_set->RepresentationBase->
           ContentProtection, gst_dash_demux_send_content_protection_event,
           stream);
+    }
+    if (active_stream->cur_adapt_set &&
+        active_stream->cur_adapt_set->RepresentationBase &&
+        active_stream->cur_adapt_set->RepresentationBase->InbandEventStream) {
+      GST_DEBUG_OBJECT (demux, "InbandEventStream detected");
+      stream->inband_event_stream =
+          g_list_copy (active_stream->cur_adapt_set->RepresentationBase->
+          InbandEventStream);
     }
 
     gst_isoff_sidx_parser_init (&stream->sidx_parser);
@@ -931,7 +972,9 @@ gst_dash_demux_setup_streams (GstAdaptiveDemux * demux)
   GstDashDemux *dashdemux = GST_DASH_DEMUX_CAST (demux);
   gboolean ret = TRUE;
   GstDateTime *now = NULL;
-  guint period_idx;
+  guint period_idx, anchor_idx;
+  gboolean has_anchor = FALSE;
+  GstSegment segment;
 
   /* setup video, audio and subtitle streams, starting from first Period if
    * non-live */
@@ -983,12 +1026,30 @@ gst_dash_demux_setup_streams (GstAdaptiveDemux * demux)
       ret = FALSE;
       goto done;
     }
+  } else if (gst_mpd_client_parse_mpd_anchor (dashdemux->client, &segment,
+          &anchor_idx)) {
+    period_idx = anchor_idx;
+    has_anchor = TRUE;
   }
 
   if (!gst_mpd_client_set_period_index (dashdemux->client, period_idx) ||
       !gst_dash_demux_setup_all_streams (dashdemux)) {
     ret = FALSE;
     goto done;
+  }
+
+  if (has_anchor) {
+    GList *iter, *streams;
+    streams = demux->streams;
+
+    GST_DEBUG_OBJECT (demux, "Seek to MPD Anchor position");
+    for (iter = streams; iter; iter = g_list_next (iter)) {
+      gst_dash_demux_stream_seek (iter->data, TRUE, 0, segment.start, NULL);
+    }
+
+    gst_segment_do_seek (&demux->segment, demux->segment.rate, GST_FORMAT_TIME,
+        GST_SEEK_FLAG_FLUSH, GST_SEEK_TYPE_SET, segment.start,
+        GST_SEEK_TYPE_SET, segment.stop, NULL);
   }
 
   /* If stream is live, try to find the segment that
@@ -1127,34 +1188,14 @@ static GstCaps *
 gst_dash_demux_get_video_input_caps (GstDashDemux * demux,
     GstActiveStream * stream)
 {
-  guint width = 0, height = 0;
-  gint fps_num = 0, fps_den = 1;
-  gboolean have_fps = FALSE;
   GstCaps *caps = NULL;
 
   if (stream == NULL)
     return NULL;
 
-  /* if bitstreamSwitching is true we dont need to swich pads on resolution change */
-  if (!gst_mpd_client_get_bitstream_switching_flag (stream)) {
-    width = gst_mpd_client_get_video_stream_width (stream);
-    height = gst_mpd_client_get_video_stream_height (stream);
-    have_fps =
-        gst_mpd_client_get_video_stream_framerate (stream, &fps_num, &fps_den);
-  }
   caps = gst_mpd_client_get_stream_caps (stream);
   if (caps == NULL)
     return NULL;
-
-  if (width > 0 && height > 0) {
-    gst_caps_set_simple (caps, "width", G_TYPE_INT, width, "height",
-        G_TYPE_INT, height, NULL);
-  }
-
-  if (have_fps) {
-    gst_caps_set_simple (caps, "framerate", GST_TYPE_FRACTION, fps_num,
-        fps_den, NULL);
-  }
 
   return caps;
 }
@@ -1163,27 +1204,14 @@ static GstCaps *
 gst_dash_demux_get_audio_input_caps (GstDashDemux * demux,
     GstActiveStream * stream)
 {
-  guint rate = 0, channels = 0;
   GstCaps *caps = NULL;
 
   if (stream == NULL)
     return NULL;
 
-  /* if bitstreamSwitching is true we dont need to swich pads on rate/channels change */
-  if (!gst_mpd_client_get_bitstream_switching_flag (stream)) {
-    channels = gst_mpd_client_get_audio_stream_num_channels (stream);
-    rate = gst_mpd_client_get_audio_stream_rate (stream);
-  }
   caps = gst_mpd_client_get_stream_caps (stream);
   if (caps == NULL)
     return NULL;
-
-  if (rate > 0) {
-    gst_caps_set_simple (caps, "rate", G_TYPE_INT, rate, NULL);
-  }
-  if (channels > 0) {
-    gst_caps_set_simple (caps, "channels", G_TYPE_INT, channels, NULL);
-  }
 
   return caps;
 }
@@ -1217,6 +1245,40 @@ gst_dash_demux_get_input_caps (GstDashDemux * demux, GstActiveStream * stream)
     default:
       return GST_CAPS_NONE;
   }
+}
+
+static void
+gst_dash_demux_set_stream_type (GstDashDemux * demux, GstDashDemuxStream *
+    stream, GstCaps * caps)
+{
+  GstStreamType type = GST_STREAM_TYPE_UNKNOWN;
+  GstActiveStream *active_stream = stream->active_stream;
+
+  g_return_if_fail (active_stream != NULL);
+
+  switch (active_stream->mimeType) {
+    case GST_STREAM_VIDEO:
+      type = GST_STREAM_TYPE_VIDEO | GST_STREAM_TYPE_CONTAINER;
+      break;
+    case GST_STREAM_AUDIO:
+      type = GST_STREAM_TYPE_AUDIO | GST_STREAM_TYPE_CONTAINER;
+      break;
+    case GST_STREAM_APPLICATION:
+      /* raw ttml text stream has no container */
+      type = GST_STREAM_TYPE_TEXT;
+      if (caps) {
+        GstStructure *s;
+        s = gst_caps_get_structure (caps, 0);
+        if (gst_structure_has_name (s, "video/quicktime"))
+          type |= GST_STREAM_TYPE_CONTAINER;
+      }
+      break;
+    default:
+      break;
+  }
+
+  gst_adaptive_demux_stream_set_stream_type (GST_ADAPTIVE_DEMUX_STREAM_CAST
+      (stream), type);
 }
 
 static void
@@ -1506,10 +1568,12 @@ gst_dash_demux_stream_seek (GstAdaptiveDemuxStream * stream, gboolean forward,
         gst_mpd_parser_get_stream_presentation_offset (dashdemux->client,
         dashstream->index);
 
-    if (G_UNLIKELY (ts < period_start))
+    if (G_UNLIKELY (ts < period_start)) {
       ts = offset;
-    else
-      ts += offset - period_start;
+    } else {
+      ts += offset;
+      ts -= period_start;
+    }
 
     if (last_index != dashstream->active_stream->segment_index ||
         last_repeat != dashstream->active_stream->segment_repeat_index) {
@@ -1527,6 +1591,8 @@ gst_dash_demux_stream_seek (GstAdaptiveDemuxStream * stream, gboolean forward,
         dashstream->sidx_position = GST_CLOCK_TIME_NONE;
         gst_isoff_sidx_parser_clear (&dashstream->sidx_parser);
       }
+      if (final_ts)
+        *final_ts += period_start;
       dashstream->pending_seek_ts = GST_CLOCK_TIME_NONE;
     } else {
       /* no index yet, seek when we have it */
@@ -2218,12 +2284,8 @@ gst_dash_demux_stream_select_bitrate (GstAdaptiveDemuxStream * stream,
     GST_INFO_OBJECT (demux, "Changing representation idx: %d %d %u",
         dashstream->index, new_index, rep->bandwidth);
     if (gst_mpd_client_setup_representation (demux->client, active_stream, rep)) {
-      GstCaps *caps;
-
       GST_INFO_OBJECT (demux, "Switching bitrate to %d",
           active_stream->cur_representation->bandwidth);
-      caps = gst_dash_demux_get_input_caps (demux, active_stream);
-      gst_adaptive_demux_stream_set_caps (stream, caps);
       ret = TRUE;
 
     } else {
@@ -2279,10 +2341,6 @@ end:
   return ret;
 }
 
-#define SEEK_UPDATES_PLAY_POSITION(r, start_type, stop_type) \
-  ((r >= 0 && start_type != GST_SEEK_TYPE_NONE) || \
-   (r < 0 && stop_type != GST_SEEK_TYPE_NONE))
-
 static gboolean
 gst_dash_demux_seek (GstAdaptiveDemux * demux, GstEvent * seek)
 {
@@ -2298,6 +2356,7 @@ gst_dash_demux_seek (GstAdaptiveDemux * demux, GstEvent * seek)
   GList *iter, *streams = NULL;
   GstDashDemux *dashdemux = GST_DASH_DEMUX_CAST (demux);
   gboolean trickmode_no_audio;
+  gboolean do_snapseek = FALSE;
 
   gst_event_parse_seek (seek, &rate, &format, &flags, &start_type, &start,
       &stop_type, &stop);
@@ -2307,7 +2366,7 @@ gst_dash_demux_seek (GstAdaptiveDemux * demux, GstEvent * seek)
     return TRUE;
   }
 
-  if (demux->segment.rate > 0.0) {
+  if (rate >= 0.0) {
     target_pos = (GstClockTime) start;
   } else {
     target_pos = (GstClockTime) stop;
@@ -2363,7 +2422,17 @@ gst_dash_demux_seek (GstAdaptiveDemux * demux, GstEvent * seek)
     if (!gst_dash_demux_setup_all_streams (dashdemux))
       return FALSE;
     streams = demux->next_streams;
+  } else if (demux->prepared_streams) {
+    /* previous streams are not exposed yet, setup again */
+    gst_active_streams_free (dashdemux->client);
+
+    if (!gst_dash_demux_setup_all_streams (dashdemux))
+      return FALSE;
+    streams = demux->next_streams;
   }
+
+  if (IS_SNAP_SEEK (flags))
+    do_snapseek = TRUE;
 
   /* Update the current sequence on all streams */
   for (iter = streams; iter; iter = g_list_next (iter)) {
@@ -2371,9 +2440,28 @@ gst_dash_demux_seek (GstAdaptiveDemux * demux, GstEvent * seek)
     GstDashDemuxStream *dashstream = iter->data;
 
     dashstream->average_skip_size = 0;
-    if (gst_dash_demux_stream_seek (stream, rate >= 0, 0, target_pos,
+    if (do_snapseek) {
+      GstClockTime final_ts;
+      if (gst_dash_demux_stream_seek (stream, rate >= 0, 0, target_pos,
+              &final_ts) != GST_FLOW_OK)
+        return FALSE;
+
+      if (GST_CLOCK_TIME_IS_VALID (final_ts) &&
+          dashstream->pending_seek_ts == GST_CLOCK_TIME_NONE)
+        target_pos = final_ts;
+      do_snapseek = FALSE;
+    } else if (gst_dash_demux_stream_seek (stream, rate >= 0, 0, target_pos,
             NULL) != GST_FLOW_OK)
       return FALSE;
+  }
+
+  if (IS_SNAP_SEEK (flags)) {
+    if (rate >= 0)
+      gst_segment_do_seek (&demux->segment, rate, format, flags, start_type,
+          target_pos, stop_type, stop, NULL);
+    else
+      gst_segment_do_seek (&demux->segment, rate, format, flags, start_type,
+          start, stop_type, target_pos, NULL);
   }
 
   return TRUE;
@@ -2841,8 +2929,10 @@ gst_dash_demux_parse_isobmff (GstAdaptiveDemux * demux,
     if (size == 0) {
       /* We assume this is mdat, anything else with "size until end"
        * does not seem to make sense */
-      g_assert (dash_stream->isobmff_parser.current_fourcc ==
-          GST_ISOFF_FOURCC_MDAT);
+      if (dash_stream->isobmff_parser.current_fourcc != GST_ISOFF_FOURCC_MDAT) {
+        GST_ERROR_OBJECT (demux, "Wrong fourcc type - invalid header");
+        return GST_FLOW_ERROR;
+      }
       dash_stream->isobmff_parser.current_size = -1;
       break;
     }
@@ -2967,6 +3057,40 @@ gst_dash_demux_parse_isobmff (GstAdaptiveDemux * demux,
           *sidx_seek_needed = TRUE;
           break;
         }
+      }
+    } else if (dash_stream->isobmff_parser.current_fourcc ==
+        GST_ISOFF_FOURCC_EMSG && dash_stream->inband_event_stream) {
+      /* Parsing "emsg" box only if InbandEventStream element was parsed from MPD */
+      GstByteReader sub_reader;
+      GstEmsgBox *emsg;
+
+      gst_byte_reader_get_sub_reader (&reader, &sub_reader, size - header_size);
+      emsg = gst_isoff_emsg_box_parse (&sub_reader);
+
+      if (emsg) {
+        /* ISO/IEC 23009-1:2014 5.10.4.2 MPD validity expiration */
+        if (strcmp (emsg->scheme_id_uri, "urn:mpeg:dash:event:2012") == 0 &&
+            gst_dash_demux_is_live (demux)) {
+          GstClockTime time_delta;      /* remaining expiration time of an MPD
+                                         * corresponding to publish_time in message_data */
+          GstClockTime fragment_dur;
+
+          time_delta =
+              gst_util_uint64_scale (emsg->presentation_time_delta, GST_SECOND,
+              emsg->timescale);
+          fragment_dur = stream->fragment.duration;
+
+          if (GST_CLOCK_TIME_IS_VALID (time_delta) &&
+              GST_CLOCK_TIME_IS_VALID (fragment_dur) &&
+              time_delta <= fragment_dur) {
+            GST_DEBUG_OBJECT (stream->pad,
+                "The last segment in representation");
+            gst_adaptive_demux_notify_manifest_expired (demux);
+            /* TODO: check emsg->value */
+          }
+        }
+        /* TODO: Add more supportable scheme_id_uri */
+        gst_isoff_emsg_box_free (emsg);
       }
     } else {
       gst_byte_reader_skip (&reader, size - header_size);
@@ -3359,7 +3483,8 @@ gst_dash_demux_handle_isobmff (GstAdaptiveDemux * demux,
           buffer =
               gst_adapter_take_buffer (dash_stream->adapter,
               sidx_end_offset - dash_stream->current_offset);
-          sidx_advance = TRUE;
+          if (has_next)
+            sidx_advance = TRUE;
         }
       }
     }
@@ -3550,6 +3675,8 @@ gst_dash_demux_stream_free (GstAdaptiveDemuxStream * stream)
     gst_isoff_moof_box_free (dash_stream->moof);
   if (dash_stream->moof_sync_samples)
     g_array_free (dash_stream->moof_sync_samples, TRUE);
+  if (dash_stream->inband_event_stream)
+    g_list_free (dash_stream->inband_event_stream);
 }
 
 static GstDashDemuxClockDrift *
@@ -3653,51 +3780,13 @@ gst_dash_demux_poll_ntp_server (GstDashDemuxClockDrift * clock_drift,
   return gst_date_time_new_from_g_date_time (dt2);
 }
 
-struct Rfc5322TimeZone
-{
-  const gchar *name;
-  gfloat tzoffset;
-};
-
-/*
- Parse an RFC5322 (section 3.3) date-time from the Date: field in the
- HTTP response. 
- See https://tools.ietf.org/html/rfc5322#section-3.3
-*/
 static GstDateTime *
 gst_dash_demux_parse_http_head (GstDashDemuxClockDrift * clock_drift,
     GstFragment * download)
 {
-  static const gchar *months[] = { NULL, "Jan", "Feb", "Mar", "Apr",
-    "May", "Jun", "Jul", "Aug",
-    "Sep", "Oct", "Nov", "Dec", NULL
-  };
-  static const struct Rfc5322TimeZone timezones[] = {
-    {"Z", 0},
-    {"UT", 0},
-    {"GMT", 0},
-    {"BST", 1},
-    {"EST", -5},
-    {"EDT", -4},
-    {"CST", -6},
-    {"CDT", -5},
-    {"MST", -7},
-    {"MDT", -6},
-    {"PST", -8},
-    {"PDT", -7},
-    {NULL, 0}
-  };
-  GstDateTime *value = NULL;
   const GstStructure *response_headers;
   const gchar *http_date;
   const GValue *val;
-  gint ret;
-  const gchar *pos;
-  gint year = -1, month = -1, day = -1, hour = -1, minute = -1, second = -1;
-  gchar zone[6];
-  gchar monthstr[4];
-  gfloat tzoffset = 0;
-  gboolean parsed_tz = FALSE;
 
   g_return_val_if_fail (download != NULL, NULL);
   g_return_val_if_fail (download->headers != NULL, NULL);
@@ -3712,62 +3801,7 @@ gst_dash_demux_parse_http_head (GstDashDemuxClockDrift * clock_drift,
     return NULL;
   }
 
-  /* skip optional text version of day of the week */
-  pos = strchr (http_date, ',');
-  if (pos)
-    pos++;
-  else
-    pos = http_date;
-  ret =
-      sscanf (pos, "%02d %3s %04d %02d:%02d:%02d %5s", &day, monthstr, &year,
-      &hour, &minute, &second, zone);
-  if (ret == 7) {
-    gchar *z = zone;
-    gint i;
-
-    for (i = 1; months[i]; ++i) {
-      if (g_ascii_strncasecmp (months[i], monthstr, strlen (months[i])) == 0) {
-        month = i;
-        break;
-      }
-    }
-    for (i = 0; timezones[i].name && !parsed_tz; ++i) {
-      if (g_ascii_strncasecmp (timezones[i].name, z,
-              strlen (timezones[i].name)) == 0) {
-        tzoffset = timezones[i].tzoffset;
-        parsed_tz = TRUE;
-      }
-    }
-    if (!parsed_tz) {
-      gint hh, mm;
-      gboolean neg = FALSE;
-      /* check if it is in the form +-HHMM */
-      if (*z == '+' || *z == '-') {
-        if (*z == '+')
-          ++z;
-        else if (*z == '-') {
-          ++z;
-          neg = TRUE;
-        }
-        ret = sscanf (z, "%02d%02d", &hh, &mm);
-        if (ret == 2) {
-          tzoffset = hh;
-          tzoffset += mm / 60.0;
-          if (neg)
-            tzoffset = -tzoffset;
-          parsed_tz = TRUE;
-        }
-      }
-    }
-    /* Accept year in both 2 digit or 4 digit format */
-    if (year < 100)
-      year += 2000;
-  }
-  if (month > 0 && parsed_tz) {
-    value = gst_date_time_new (tzoffset,
-        year, month, day, hour, minute, second);
-  }
-  return value;
+  return gst_adaptive_demux_parse_http_head_date (http_date);
 }
 
 /*
@@ -3896,8 +3930,8 @@ gst_dash_demux_poll_clock_drift (GstDashDemux * demux)
     }
     download =
         gst_uri_downloader_fetch_uri_with_range (GST_ADAPTIVE_DEMUX_CAST
-        (demux)->downloader, urls[clock_drift->selected_url], NULL, TRUE, TRUE,
-        TRUE, range_start, range_end, NULL);
+        (demux)->downloader, urls[clock_drift->selected_url], NULL, NULL, NULL,
+        TRUE, TRUE, TRUE, range_start, range_end, NULL);
     if (download) {
       if (method == GST_MPD_UTCTIMING_TYPE_HTTP_HEAD && download->headers) {
         value = gst_dash_demux_parse_http_head (clock_drift, download);

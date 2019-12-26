@@ -19,7 +19,7 @@
  */
 
 #ifdef HAVE_CONFIG_H
-#  include "config.h"
+#include "config.h"
 #endif
 
 #include <gst/base/base.h>
@@ -28,6 +28,9 @@
 #include "gsth265parse.h"
 
 #include <string.h>
+
+#include <math.h>
+#include <gst/math-compat.h>
 
 GST_DEBUG_CATEGORY (h265_parse_debug);
 #define GST_CAT_DEFAULT h265_parse_debug
@@ -45,6 +48,8 @@ enum
   GST_H265_PARSE_FORMAT_NONE,
   GST_H265_PARSE_FORMAT_HVC1,
   GST_H265_PARSE_FORMAT_HEV1,
+  GST_H265_PARSE_FORMAT_LHE1,
+  GST_H265_PARSE_FORMAT_LHV1,
   GST_H265_PARSE_FORMAT_BYTE
 };
 
@@ -238,6 +243,11 @@ gst_h265_parse_reset (GstH265Parse * h265parse)
   h265parse->discont = FALSE;
 
   gst_h265_parse_reset_stream_info (h265parse);
+
+  h265parse->is_dolby_hdr = FALSE;
+  h265parse->has_dolby_vision_field = FALSE;
+
+  gst_h265_parse_reset_stream_info (h265parse);
 }
 
 static gboolean
@@ -278,6 +288,10 @@ gst_h265_parse_get_string (GstH265Parse * parse, gboolean format, gint code)
         return "hvc1";
       case GST_H265_PARSE_FORMAT_HEV1:
         return "hev1";
+      case GST_H265_PARSE_FORMAT_LHE1:
+        return "lhe1";
+      case GST_H265_PARSE_FORMAT_LHV1:
+        return "lhv1";
       case GST_H265_PARSE_FORMAT_BYTE:
         return "byte-stream";
       default:
@@ -318,6 +332,10 @@ gst_h265_parse_format_from_caps (GstCaps * caps, guint * format, guint * align)
           *format = GST_H265_PARSE_FORMAT_HVC1;
         else if (strcmp (str, "hev1") == 0)
           *format = GST_H265_PARSE_FORMAT_HEV1;
+        else if (strcmp (str, "lhe1") == 0)
+          *format = GST_H265_PARSE_FORMAT_LHE1;
+        else if (strcmp (str, "lhv1") == 0)
+          *format = GST_H265_PARSE_FORMAT_LHV1;
         else if (strcmp (str, "byte-stream") == 0)
           *format = GST_H265_PARSE_FORMAT_BYTE;
       }
@@ -385,8 +403,7 @@ gst_h265_parse_negotiate (GstH265Parse * h265parse, gint in_format,
   h265parse->format = format;
   h265parse->align = align;
 
-  h265parse->transform = in_format != h265parse->format ||
-      align == GST_H265_PARSE_ALIGN_AU;
+  h265parse->transform = in_format != h265parse->format;
 
   if (caps)
     gst_caps_unref (caps);
@@ -403,8 +420,7 @@ gst_h265_parse_wrap_nal (GstH265Parse * h265parse, guint format, guint8 * data,
   GST_DEBUG_OBJECT (h265parse, "nal length %d", size);
 
   buf = gst_buffer_new_allocate (NULL, 4 + size, NULL);
-  if (format == GST_H265_PARSE_FORMAT_HVC1
-      || format == GST_H265_PARSE_FORMAT_HEV1) {
+  if (format != GST_H265_PARSE_FORMAT_BYTE) {
     tmp = GUINT32_TO_BE (size << (32 - 8 * nl));
   } else {
     /* HACK: nl should always be 4 here, otherwise this won't work.
@@ -515,9 +531,41 @@ _nal_name (GstH265NalUnitType nal_type)
 }
 #endif
 
+static void
+gst_h265_parse_process_sei (GstH265Parse * h265parse, GstH265NalUnit * nalu)
+{
+  GstH265SEIMessage sei;
+  GstH265Parser *nalparser = h265parse->nalparser;
+  GstH265ParserResult pres;
+  GArray *messages;
+  guint i;
+
+  pres = gst_h265_parser_parse_sei (nalparser, nalu, &messages);
+  if (pres != GST_H265_PARSER_OK)
+    GST_WARNING_OBJECT (h265parse, "failed to parse one or more SEI message");
+
+  /* Even if pres != GST_H265_PARSER_OK, some message could have been parsed and
+   * stored in messages.
+   */
+  for (i = 0; i < messages->len; i++) {
+    sei = g_array_index (messages, GstH265SEIMessage, i);
+    switch (sei.payloadType) {
+      case GST_H265_SEI_USER_DATA:
+        if (sei.payload.user_data.payload_byte != NULL)
+          h265parse->user_data =
+              g_strdup_printf ("%s", sei.payload.user_data.payload_byte);
+        GST_DEBUG_OBJECT (h265parse, "SEI user-data %s", h265parse->user_data);
+        g_free (sei.payload.user_data.payload_byte);
+        break;
+    }
+  }
+  g_array_free (messages, TRUE);
+}
+
 /* caller guarantees 2 bytes of nal payload */
 static gboolean
-gst_h265_parse_process_nal (GstH265Parse * h265parse, GstH265NalUnit * nalu)
+gst_h265_parse_process_nal (GstH265Parse * h265parse, GstH265NalUnit * nalu,
+    gboolean is_codec_data)
 {
   GstH265PPS pps = { 0, };
   GstH265SPS sps = { 0, };
@@ -550,7 +598,8 @@ gst_h265_parse_process_nal (GstH265Parse * h265parse, GstH265NalUnit * nalu)
 
       GST_DEBUG_OBJECT (h265parse, "triggering src caps check");
       h265parse->update_caps = TRUE;
-      h265parse->have_vps = TRUE;
+      if (!is_codec_data)
+        h265parse->have_vps = TRUE;
       if (h265parse->push_codec && h265parse->have_pps) {
         /* VPS/SPS/PPS found in stream before the first pre_push_frame, no need
          * to forcibly push at start */
@@ -579,7 +628,8 @@ gst_h265_parse_process_nal (GstH265Parse * h265parse, GstH265NalUnit * nalu)
 
       GST_DEBUG_OBJECT (h265parse, "triggering src caps check");
       h265parse->update_caps = TRUE;
-      h265parse->have_sps = TRUE;
+      if (!is_codec_data)
+        h265parse->have_sps = TRUE;
       if (h265parse->push_codec && h265parse->have_pps) {
         /* SPS and PPS found in stream before the first pre_push_frame, no need
          * to forcibly push at start */
@@ -614,7 +664,8 @@ gst_h265_parse_process_nal (GstH265Parse * h265parse, GstH265NalUnit * nalu)
         GST_DEBUG_OBJECT (h265parse, "triggering src caps check");
         h265parse->update_caps = TRUE;
       }
-      h265parse->have_pps = TRUE;
+      if (!is_codec_data)
+        h265parse->have_pps = TRUE;
       if (h265parse->push_codec && h265parse->have_sps) {
         /* SPS and PPS found in stream before the first pre_push_frame, no need
          * to forcibly push at start */
@@ -633,6 +684,11 @@ gst_h265_parse_process_nal (GstH265Parse * h265parse, GstH265NalUnit * nalu)
       /* expected state: got-sps */
       if (!GST_H265_PARSE_STATE_VALID (h265parse, GST_H265_PARSE_STATE_GOT_SPS))
         return FALSE;
+
+      h265parse->header |= TRUE;
+
+      gst_h265_parse_process_sei (h265parse, nalu);
+      h265parse->update_caps = TRUE;
 
       h265parse->header |= TRUE;
       /*Fixme: parse sei messages */
@@ -687,6 +743,8 @@ gst_h265_parse_process_nal (GstH265Parse * h265parse, GstH265NalUnit * nalu)
       GST_DEBUG_OBJECT (h265parse,
           "parse result %d, first slice_segment: %u, slice type: %u",
           pres, slice.first_slice_segment_in_pic_flag, slice.type);
+      GST_DEBUG_OBJECT (h265parse,
+          "frame-num(lsb) %d", slice.pic_order_cnt_lsb);
 
       gst_h265_slice_hdr_free (&slice);
     }
@@ -721,6 +779,63 @@ gst_h265_parse_process_nal (GstH265Parse * h265parse, GstH265NalUnit * nalu)
       pres = gst_h265_parser_parse_nal (nalparser, nalu);
       if (pres != GST_H265_PARSER_OK)
         return FALSE;
+      break;
+    case GST_H265_NAL_DOLBY_HDR_META_DATA:
+      if (nalu->data[nalu->offset + 1] == 0x01) {
+        GST_LOG_OBJECT (h265parse, "Got DolbyHDR META NAL");
+
+        if (h265parse->has_dolby_vision_field && !h265parse->is_dolby_hdr) {
+          /*FIXME: currently parsing rpu is not needed */
+#if 0
+          GstH265DvRPU rpu;
+          pres = gst_h265_parser_parse_dv_rpu (nalparser, nalu, &rpu);
+#endif
+          h265parse->update_caps = TRUE;
+          h265parse->is_dolby_hdr = TRUE;
+        }
+      } else {
+        GST_WARNING_OBJECT (h265parse,
+            "This nal type is dolby HDR, but second byte is not 0x%02X",
+            nalu->data[nalu->offset + 1]);
+      }
+      break;
+    case GST_H265_NAL_DOLBY_HDR_ENHANCED_LAYER:
+      if (nalu->data[nalu->offset + 1] == 0x01) {
+#ifndef GST_DISABLE_GST_DEBUG
+        guint next_nal_type;
+
+        next_nal_type = ((nalu->data[nalu->offset + 2] & 0x7e) >> 1);
+        GST_LOG_OBJECT (h265parse, "Got DolbyHDR EL NAL: nal of type %u %s",
+            next_nal_type, _nal_name (next_nal_type));
+#endif
+      } else {
+        GST_WARNING_OBJECT (h265parse,
+            "This nal type is dolby HDR, but second byte is not 0x%02X",
+            nalu->data[nalu->offset + 1]);
+      }
+#ifndef GST_DISABLE_GST_DEBUG
+      {
+        /* The following code is just for debugging about DolbyHDR. */
+        GstH265SliceHdr slice;
+
+        nalu->offset += 2;
+        pres = gst_h265_parser_parse_slice_hdr (nalparser, nalu, &slice);
+
+        if (pres == GST_H265_PARSER_OK) {
+          if (slice.first_slice_segment_in_pic_flag == 1)
+            GST_LOG_OBJECT (h265parse,
+                "Dolby EL: frame start, first_slice_segment_in_pic_flag = 1");
+
+          GST_LOG_OBJECT (h265parse,
+              "Dolby EL: parse result %d, first slice_segment: %u, slice type: %u",
+              pres, slice.first_slice_segment_in_pic_flag, slice.type);
+          GST_LOG_OBJECT (h265parse,
+              "Dolby EL: frame-num(lsb) %d", slice.pic_order_cnt_lsb);
+        }
+        gst_h265_slice_hdr_free (&slice);
+        nalu->offset -= 2;
+      }
+#endif
       break;
     default:
       /* drop anything before the initial SPS */
@@ -791,6 +906,7 @@ gst_h265_parse_collect_nal (GstH265Parse * h265parse, const guint8 * data,
               && nal_type <= GST_H265_NAL_SLICE_RASL_R)
           || (nal_type >= GST_H265_NAL_SLICE_BLA_W_LP
               && nal_type <= RESERVED_IRAP_NAL_TYPE_MAX))
+      && (nnalu.data != NULL)
       && (nnalu.data[nnalu.offset + 2] & 0x80));
 
   GST_LOG_OBJECT (h265parse, "au complete: %d", complete);
@@ -833,7 +949,7 @@ gst_h265_parse_handle_frame_packetized (GstBaseParse * parse,
     GST_DEBUG_OBJECT (h265parse, "HEVC nal offset %d", nalu.offset + nalu.size);
 
     /* either way, have a look at it */
-    gst_h265_parse_process_nal (h265parse, &nalu);
+    gst_h265_parse_process_nal (h265parse, &nalu, FALSE);
 
     /* dispatch per NALU if needed */
     if (h265parse->split_packetized) {
@@ -862,6 +978,14 @@ gst_h265_parse_handle_frame_packetized (GstBaseParse * parse,
   gst_buffer_unmap (buffer, &map);
 
   if (!h265parse->split_packetized) {
+    if (h265parse->need_codec_data &&
+        (!h265parse->have_sps || !h265parse->have_pps)) {
+      GST_WARNING_OBJECT (h265parse,
+          "skipping data, not ready to make codec data");
+      gst_h265_parse_reset_frame (h265parse);
+      gst_buffer_unref (buffer);
+      return GST_FLOW_OK;
+    }
     gst_h265_parse_parse_frame (parse, frame);
     ret = gst_base_parse_finish_frame (parse, frame, map.size);
   } else {
@@ -1051,7 +1175,7 @@ gst_h265_parse_handle_frame (GstBaseParse * parse,
       }
     }
 
-    if (!gst_h265_parse_process_nal (h265parse, &nalu)) {
+    if (!gst_h265_parse_process_nal (h265parse, &nalu, FALSE)) {
       GST_WARNING_OBJECT (h265parse,
           "broken/invalid nal Type: %d %s, Size: %u will be dropped",
           nalu.type, _nal_name (nalu.type), nalu.size);
@@ -1195,8 +1319,8 @@ gst_h265_parse_make_codec_data (GstH265Parse * h265parse)
   }
   data[6] |=
       (pft->progressive_source_flag << 7) | (pft->interlaced_source_flag << 6) |
-      (pft->non_packed_constraint_flag << 5) | (pft->
-      frame_only_constraint_flag << 4);
+      (pft->
+      non_packed_constraint_flag << 5) | (pft->frame_only_constraint_flag << 4);
   data[12] = pft->level_idc;
   /* min_spatial_segmentation_idc */
   GST_WRITE_UINT16_BE (data + 13, min_spatial_segmentation_idc);
@@ -1553,9 +1677,8 @@ gst_h265_parse_update_src_caps (GstH265Parse * h265parse, GstCaps * caps)
   GST_DEBUG_OBJECT (h265parse, "sps: %p", sps);
 
   /* only codec-data for nice-and-clean au aligned packetized hevc format */
-  if ((h265parse->format == GST_H265_PARSE_FORMAT_HVC1
-          || h265parse->format == GST_H265_PARSE_FORMAT_HEV1)
-      && h265parse->align == GST_H265_PARSE_ALIGN_AU) {
+  if (h265parse->format != GST_H265_PARSE_FORMAT_BYTE &&
+      h265parse->align == GST_H265_PARSE_ALIGN_AU) {
     buf = gst_h265_parse_make_codec_data (h265parse);
     if (buf && h265parse->codec_data) {
       GstMapInfo map;
@@ -1686,6 +1809,12 @@ gst_h265_parse_update_src_caps (GstH265Parse * h265parse, GstCaps * caps)
             chroma_format, "bit-depth-luma", G_TYPE_UINT,
             sps->bit_depth_luma_minus8 + 8, "bit-depth-chroma", G_TYPE_UINT,
             bit_depth_chroma, NULL);
+    }
+
+    if (h265parse->user_data != NULL) {
+      caps = gst_caps_copy (sink_caps);
+      gst_caps_set_simple (caps, "user-data", G_TYPE_STRING,
+          h265parse->user_data, NULL);
     }
   }
 
@@ -2163,17 +2292,101 @@ gst_h265_parse_pre_push_frame (GstBaseParse * parse, GstBaseParseFrame * frame)
 }
 
 static gboolean
+gst_h265_parse_handle_codec_data (GstH265Parse * h265parse,
+    const GValue * value, gboolean is_enhancement)
+{
+  GstMapInfo map;
+  guint8 *data;
+  guint num_nal_arrays;
+  gsize off, size;
+  guint num_nals, i, j;
+  GstBuffer *codec_data = NULL;
+  gboolean ret = FALSE;
+  GstH265ParserResult parseres;
+  GstH265NalUnit nalu;
+
+  GST_DEBUG_OBJECT (h265parse, "have packetized h265");
+  /* make note for optional split processing */
+  h265parse->packetized = TRUE;
+
+  codec_data = gst_value_get_buffer (value);
+  if (!codec_data)
+    goto wrong_type;
+  gst_buffer_map (codec_data, &map, GST_MAP_READ);
+  data = map.data;
+  size = map.size;
+
+  /* parse the hvcC data */
+  if (size < (is_enhancement ? 6 : 23)) {
+    gst_buffer_unmap (codec_data, &map);
+    goto hvcc_too_small;
+  }
+  /* parse the version, this must be one but
+   * is zero until the spec is finalized */
+  if (data[0] != 0 && data[0] != 1) {
+    gst_buffer_unmap (codec_data, &map);
+    goto wrong_version;
+  }
+
+  h265parse->nal_length_size = (data[is_enhancement ? 4 : 21] & 0x03) + 1;
+  GST_DEBUG_OBJECT (h265parse, "nal length size %u",
+      h265parse->nal_length_size);
+
+  num_nal_arrays = data[is_enhancement ? 5 : 22];
+  off = is_enhancement ? 6 : 23;
+
+  for (i = 0; i < num_nal_arrays; i++) {
+    if (off + 3 >= size) {
+      gst_buffer_unmap (codec_data, &map);
+      goto hvcc_too_small;
+    }
+
+    num_nals = GST_READ_UINT16_BE (data + off + 1);
+    off += 3;
+    for (j = 0; j < num_nals; j++) {
+      parseres = gst_h265_parser_identify_nalu_hevc (h265parse->nalparser,
+          data, off, size, 2, &nalu);
+
+      if (parseres != GST_H265_PARSER_OK) {
+        gst_buffer_unmap (codec_data, &map);
+        goto hvcc_too_small;
+      }
+
+      gst_h265_parse_process_nal (h265parse, &nalu, TRUE);
+      off = nalu.offset + nalu.size;
+    }
+  }
+  gst_buffer_unmap (codec_data, &map);
+
+  ret = TRUE;
+
+done:
+  return ret;
+
+hvcc_too_small:
+  {
+    GST_DEBUG_OBJECT (h265parse, "hvcC size %" G_GSIZE_FORMAT " < 23", size);
+    goto done;
+  }
+wrong_version:
+  {
+    GST_DEBUG_OBJECT (h265parse, "wrong hvcC version");
+    goto done;
+  }
+wrong_type:
+  {
+    GST_DEBUG_OBJECT (h265parse, "wrong codec-data type");
+    goto done;
+  }
+}
+
+static gboolean
 gst_h265_parse_set_caps (GstBaseParse * parse, GstCaps * caps)
 {
   GstH265Parse *h265parse;
   GstStructure *str;
   const GValue *value;
-  GstBuffer *codec_data = NULL;
-  gsize off, size;
   guint format, align;
-  guint num_nals, i, j;
-  GstH265NalUnit nalu;
-  GstH265ParserResult parseres;
   GstCaps *old_caps;
 
   h265parse = GST_H265_PARSE (parse);
@@ -2204,62 +2417,20 @@ gst_h265_parse_set_caps (GstBaseParse * parse, GstCaps * caps)
   /* packetized video has a codec_data */
   if (format != GST_H265_PARSE_FORMAT_BYTE &&
       (value = gst_structure_get_value (str, "codec_data"))) {
-    GstMapInfo map;
-    guint8 *data;
-    guint num_nal_arrays;
+    gboolean is_enhancement = FALSE;
 
-    GST_DEBUG_OBJECT (h265parse, "have packetized h265");
-    /* make note for optional split processing */
+    if (format == GST_H265_PARSE_FORMAT_LHE1
+        || format == GST_H265_PARSE_FORMAT_LHV1)
+      is_enhancement = TRUE;
+
+    if (!gst_h265_parse_handle_codec_data (h265parse, value, is_enhancement))
+      goto refuse_caps;
+  } else if (format == GST_H265_PARSE_FORMAT_HEV1 ||
+      format == GST_H265_PARSE_FORMAT_HVC1) {
+    GST_DEBUG_OBJECT (h265parse, "have packetized h265 but no codec data");
     h265parse->packetized = TRUE;
-
-    codec_data = gst_value_get_buffer (value);
-    if (!codec_data)
-      goto wrong_type;
-    gst_buffer_map (codec_data, &map, GST_MAP_READ);
-    data = map.data;
-    size = map.size;
-
-    /* parse the hvcC data */
-    if (size < 23) {
-      gst_buffer_unmap (codec_data, &map);
-      goto hvcc_too_small;
-    }
-    /* parse the version, this must be one but
-     * is zero until the spec is finalized */
-    if (data[0] != 0 && data[0] != 1) {
-      gst_buffer_unmap (codec_data, &map);
-      goto wrong_version;
-    }
-
-    h265parse->nal_length_size = (data[21] & 0x03) + 1;
-    GST_DEBUG_OBJECT (h265parse, "nal length size %u",
-        h265parse->nal_length_size);
-
-    num_nal_arrays = data[22];
-    off = 23;
-
-    for (i = 0; i < num_nal_arrays; i++) {
-      if (off + 3 >= size) {
-        gst_buffer_unmap (codec_data, &map);
-        goto hvcc_too_small;
-      }
-
-      num_nals = GST_READ_UINT16_BE (data + off + 1);
-      off += 3;
-      for (j = 0; j < num_nals; j++) {
-        parseres = gst_h265_parser_identify_nalu_hevc (h265parse->nalparser,
-            data, off, size, 2, &nalu);
-
-        if (parseres != GST_H265_PARSER_OK) {
-          gst_buffer_unmap (codec_data, &map);
-          goto hvcc_too_small;
-        }
-
-        gst_h265_parse_process_nal (h265parse, &nalu);
-        off = nalu.offset + nalu.size;
-      }
-    }
-    gst_buffer_unmap (codec_data, &map);
+    h265parse->need_codec_data = TRUE;
+    h265parse->nal_length_size = 4;
   } else {
     GST_DEBUG_OBJECT (h265parse, "have bytestream h265");
     /* nothing to pre-process */
@@ -2290,14 +2461,22 @@ gst_h265_parse_set_caps (GstBaseParse * parse, GstCaps * caps)
 
   if (format == h265parse->format && align == h265parse->align) {
     /* do not set CAPS and passthrough mode if SPS/PPS have not been parsed */
-    if (h265parse->have_sps && h265parse->have_pps) {
-      gst_base_parse_set_passthrough (parse, TRUE);
+    if ((h265parse->have_sps && h265parse->have_pps) ||
+        (!gst_pad_has_current_caps (GST_BASE_PARSE_SRC_PAD (parse)) &&
+            parse->segment.rate < 0.0)) {
+      //gst_base_parse_set_passthrough (parse, TRUE);
 
       /* we did parse codec-data and might supplement src caps */
       gst_h265_parse_update_src_caps (h265parse, caps);
     }
-  } else if (format == GST_H265_PARSE_FORMAT_HVC1
-      || format == GST_H265_PARSE_FORMAT_HEV1) {
+    /* Always insert codec data into buffer */
+    if (format != GST_H265_PARSE_FORMAT_BYTE) {
+      h265parse->push_codec = TRUE;
+      h265parse->have_vps = FALSE;
+      h265parse->have_sps = FALSE;
+      h265parse->have_pps = FALSE;
+    }
+  } else if (format != GST_H265_PARSE_FORMAT_BYTE) {
     /* if input != output, and input is hevc, must split before anything else */
     /* arrange to insert codec-data in-stream if needed.
      * src caps are only arranged for later on */
@@ -2310,24 +2489,13 @@ gst_h265_parse_set_caps (GstBaseParse * parse, GstCaps * caps)
     h265parse->packetized = TRUE;
   }
 
+  /* Dolby HDR */
+  if (gst_structure_has_field (str, "dolby-vision"))
+    h265parse->has_dolby_vision_field = TRUE;
+
   return TRUE;
 
   /* ERRORS */
-hvcc_too_small:
-  {
-    GST_DEBUG_OBJECT (h265parse, "hvcC size %" G_GSIZE_FORMAT " < 23", size);
-    goto refuse_caps;
-  }
-wrong_version:
-  {
-    GST_DEBUG_OBJECT (h265parse, "wrong hvcC version");
-    goto refuse_caps;
-  }
-wrong_type:
-  {
-    GST_DEBUG_OBJECT (h265parse, "wrong codec-data type");
-    goto refuse_caps;
-  }
 refuse_caps:
   {
     GST_WARNING_OBJECT (h265parse, "refused caps %" GST_PTR_FORMAT, caps);

@@ -6,7 +6,9 @@
 #define __GST_MMS_H__
 
 #include <gst/gst.h>
+#define INCLUDE_LMF
 #include <libmms/mmsx.h>
+#undef INCLUDE_LMF
 #include <gst/base/gstpushsrc.h>
 
 G_BEGIN_DECLS
@@ -35,6 +37,9 @@ struct _GstMMS
   guint64  connection_speed;
   
   mmsx_t *connection;
+
+  gdouble mms_playrate;
+  gboolean interrupted;         /* Signal unlock(). */
 };
 
 struct _GstMMSClass 
