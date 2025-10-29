@@ -50,7 +50,7 @@ in order to compile addtional GStreamer plugins) by issuing:
 
 ```
 git clone https://github.com/lgstreamer/gst-plugins-bad.git
-cd gst-plugins-base
+cd gst-plugins-bad
 . /opt/webos-sdk-x86_64/1.0.g/environment-setup-armv7a-neon-webos-linux-gnueabi
 ./autogen.sh --noconfigure
 patch -p1 < gst-plugins-bad-1.14.4-make43.patch

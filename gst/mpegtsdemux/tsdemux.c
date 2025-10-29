@@ -528,6 +528,7 @@ typedef struct
       "mute = (boolean) { FALSE, TRUE }; " \
     "audio/x-ac3; audio/x-eac3;" \
     "audio/x-ac4;" \
+    "audio/x-dts; audio/x-dtsh; audio/x-dtse; audio/x-dtsl;" \
     "audio/x-opus;" \
     "audio/x-private-ts-lpcm;" \
     "audio/x-private2-lpcm" \
@@ -2187,6 +2188,75 @@ gst_ts_demux_set_caps_for_private_teletext (TSDemuxStream * stream,
 }
 
 static void
+gst_ts_demux_set_caps_for_private_dts (TSDemuxStream * stream, GstCaps ** caps)
+{
+  gint16 asset_construction;
+  enum
+  { DTS, DTS_HD, DTS_EXPRESS, DTS_LOSSLESS };
+  gint8 dts_type = DTS;
+  gboolean core_present = FALSE;
+  gboolean ext_core = FALSE;
+  gboolean ext_xll = FALSE;
+  gboolean ext_lbr = FALSE;
+  const GstMpegtsDescriptor *desc = NULL;
+
+  desc = mpegts_get_descriptor_from_stream ((MpegTSBaseStream *) stream,
+      GST_MTS_DESC_DVB_EXTENSION);
+
+  if (desc != NULL
+      && desc->tag_extension == GST_MTS_DESC_EXT_DVB_DTS_HD_AUDIO_STREAM) {
+    core_present = (desc->data[3] & 0x80) >> 7;
+    asset_construction = (desc->data[7] & 0xF8) >> 3;
+
+    switch (asset_construction) {
+      case 14:
+      case 15:
+      case 16:
+      case 17:
+        ext_xll = TRUE;
+        break;
+      case 18:
+        ext_lbr = TRUE;
+        break;
+      case 19:
+      case 20:
+        ext_core = TRUE;
+        break;
+      case 21:
+        ext_xll = TRUE;
+        ext_core = TRUE;
+        break;
+    }
+
+    if (!core_present) {
+      if (ext_xll && !ext_core)
+        dts_type = DTS_LOSSLESS;
+      else if (ext_lbr)
+        dts_type = DTS_EXPRESS;
+      else
+        dts_type = DTS_HD;
+    } else
+      dts_type = DTS_HD;
+  }
+
+  switch (dts_type) {
+    case DTS_HD:
+      *caps = gst_caps_new_empty_simple ("audio/x-dtsh");
+      break;
+    case DTS_EXPRESS:
+      *caps = gst_caps_new_empty_simple ("audio/x-dtse");
+      break;
+    case DTS_LOSSLESS:
+      *caps = gst_caps_new_empty_simple ("audio/x-dtsl");
+      break;
+    case DTS:
+    default:
+      *caps = gst_caps_new_empty_simple ("audio/x-dts");
+      break;
+  }
+}
+
+static void
 gst_ts_demux_set_caps_for_private_dovi_video (GstTSDemux * tsdemux,
     TSDemuxStream * stream, GstCaps ** caps, const guint8 * desc,
     gboolean dolby_vision_support)
@@ -2619,6 +2689,13 @@ create_pad_for_stream (MpegTSBase * base, MpegTSBaseStream * bstream,
         caps = gst_caps_new_empty_simple ("subpicture/x-pgs");
         sparse = TRUE;
         break;
+      case ST_BD_AUDIO_DTS:
+      case ST_BD_AUDIO_DTS_HD:
+      case ST_BD_AUDIO_DTS_HD_MASTER_AUDIO:
+        is_audio = TRUE;
+        caps = gst_caps_new_empty_simple ("audio/x-dts");
+        stream->target_pes_substream = 0x71;
+        break;
     }
   }
 
@@ -2736,6 +2813,36 @@ create_pad_for_stream (MpegTSBase * base, MpegTSBaseStream * bstream,
 
       desc =
           mpegts_get_descriptor_from_stream (bstream,
+          GST_MTS_DESC_DVB_EXTENSION);
+      if (desc != NULL
+          && desc->tag_extension == GST_MTS_DESC_EXT_DVB_DTS_UHD_AUDIO_STREAM
+          && desc->length >= 3) {
+        gint decoder_profile_code = -1;
+
+        decoder_profile_code = (desc->data[3] & 0xFC) >> 2;
+        if (decoder_profile_code == 0) {
+          GST_LOG ("DVB DTS UHD audio");
+          is_audio = TRUE;
+          caps = gst_caps_new_empty_simple ("audio/x-dtsx");
+          tag_name = GST_TAG_AUDIO_CODEC;
+          codec_name = g_strdup ("DTS-UHD audio");
+        }
+        break;
+      }
+
+      desc =
+          mpegts_get_descriptor_from_stream (bstream, GST_MTS_DESC_DVB_DTS);
+      if (desc) {
+        GST_LOG ("DVB DTS audio");
+        is_audio = TRUE;
+        caps = gst_caps_new_empty_simple ("audio/x-dts");
+        tag_name = GST_TAG_AUDIO_CODEC;
+        codec_name = g_strdup ("DVB DTS audio");
+        break;
+      }
+
+      desc =
+          mpegts_get_descriptor_from_stream (bstream,
           GST_MTS_DESC_DVB_TELETEXT);
       if (desc) {
         GST_LOG ("DVB teletext");
@@ -2773,6 +2880,16 @@ create_pad_for_stream (MpegTSBase * base, MpegTSBaseStream * bstream,
       }
 
       switch (bstream->registration_id) {
+        case DRF_ID_DTS1:
+        case DRF_ID_DTS2:
+        case DRF_ID_DTS3:
+        case DRF_ID_DTSH:
+          /* SMPTE registered DTS */
+          is_audio = TRUE;
+          gst_ts_demux_set_caps_for_private_dts (stream, &caps);
+          tag_name = GST_TAG_AUDIO_CODEC;
+          codec_name = g_strdup ("dts audio");
+          break;
         case DRF_ID_S302M:
           is_audio = TRUE;
           caps = gst_caps_new_empty_simple ("audio/x-smpte-302m");
@@ -3292,6 +3409,12 @@ create_pad_for_stream (MpegTSBase * base, MpegTSBaseStream * bstream,
         tag_name = GST_TAG_AUDIO_CODEC;
         codec_name = g_strdup ("2-ch LPCM audio via IEEE1394 Bus");
       }
+      break;
+    case ST_PS_AUDIO_DTS:
+      is_audio = TRUE;
+      caps = gst_caps_new_empty_simple ("audio/x-dts");
+      tag_name = GST_TAG_AUDIO_CODEC;
+      codec_name = g_strdup ("DTS audio");
       break;
     case ST_PS_AUDIO_LPCM:
       is_audio = TRUE;
