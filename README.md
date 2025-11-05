@@ -58,8 +58,33 @@ patch -p1 < gst-plugins-bad-1.14.4-make43.patch
 ./autogen.sh --host=arm-webos-linux-gnueabi --with-sysroot=${SDKTARGETSYSROOT} \
   --prefix=${SDKTARGETSYSROOT}/usr/ \
   --disable-silent-rules --disable-dependency-tracking --disable-gtk-doc \
-  --disable-introspection --disable-examples --disable-static \
-  --disable-debug --enable-nls
+  --disable-introspection --disable-examples --enable-dvb --enable-netsim \
+  --enable-shm --disable-acm --disable-android_media --disable-aom \
+  --disable-apple_media --disable-avc --disable-bs2b --disable-chromaprint \
+  --disable-daala --disable-decklink --disable-direct3d \
+  --disable-directsound --disable-dts --disable-fbdev --disable-fdk_aac \
+  --disable-gme --disable-gsm --disable-ipcpipeline --disable-iqa \
+  --disable-kate --disable-ladspa --disable-lv2 --disable-mpeg2enc \
+  --disable-mplex --disable-msdk --disable-musepack --disable-nvenc \
+  --disable-ofa --disable-openexr --disable-openmpt --disable-openni2 \
+  --disable-opensles --disable-soundtouch --disable-spandsp \
+  --disable-spc --disable-srt --disable-teletextdec --disable-vcd \
+  --disable-vdpau --disable-wasapi --disable-wildmidi \
+  --disable-winks --disable-winscreencap --disable-x265 \
+  --disable-zbar --disable-static --disable-assrender --disable-bluez \
+  --enable-bz2 --enable-curl --enable-dash --disable-dc1394 \
+  --disable-debug --disable-directfb --disable-dtls --disable-faac \
+  --disable-faad --disable-flite --disable-fluidsynth --enable-gl \
+  --enable-hls --with-hls-crypto=nettle --disable-kms --disable-lcms2 \
+  --disable-libde265 --disable-libmms --disable-libssh2 --disable-modplug \
+  --disable-msdk --disable-neon --disable-openal --disable-opencv \
+  --disable-openh264 --disable-openjpeg --disable-openmpt \
+  --disable-opus --disable-orc  --disable-resindvd --disable-rsvg \
+  --disable-rtmp --disable-sbc --enable-smoothstreaming \
+  --disable-sndfile --disable-srtp --disable-tinyalsa --disable-ttml \
+  --disable-uvch264 --disable-valgrind --disable-voaacenc \
+  --disable-voamrwbenc --disable-vulkan --enable-wayland --disable-webp \
+  --disable-webrtc --disable-webrtcdsp --enable-nls --enable-adpcmdec
 ./fix_sysroot.sh
 make -j6
 ```
