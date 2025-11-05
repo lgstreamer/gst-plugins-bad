@@ -1878,15 +1878,15 @@ GST_START_TEST (test_codec_preference_ddp6ch)
   };
   gint expected_width[] = { 480, 640, 960, 1280, 1920, 1920 };
   gint expected_height[] = { 270, 360, 540, 720, 1080, 1080 };
-  gchar *expected_codecs[] = { "avc1.4d401e,ec-3", "avc1.4d401f,ec-3",
+  gchar const *expected_codecs[] = { "avc1.4d401e,ec-3", "avc1.4d401f,ec-3",
     "avc1.4d4028,ec-3", "avc1.4d4028,ec-3", "avc1.4d4029,ec-3",
     "avc1.4d4029,ec-3"
   };
-  gchar *expected_media_name[] = { "English Track", "French Track",
+  gchar const *expected_media_name[] = { "English Track", "French Track",
     "Spanish Track", "Chinese Track"
   };
-  gchar *expected_media_lang[] = { "en", "fr", "es", "zh" };
-  gchar *expected_media_uri[] = {
+  gchar const *expected_media_lang[] = { "en", "fr", "es", "zh" };
+  gchar const *expected_media_uri[] = {
     "http://localhost/Audio_fMP4/ChID_voices_6ch_256kbps_ddp_sub.m3u8",
     "http://localhost/Audio_fMP4/ChID_voices_fra_6ch_256kbps_ddp_sub.m3u8",
     "http://localhost/Audio_fMP4/ChID_voices_spa_6ch_256kbps_ddp_sub.m3u8",
@@ -1937,12 +1937,12 @@ GST_START_TEST (test_codec_preference_atmos_high)
   gint expected_bandwidth[] = { 1984538, 3332501, 5121750 };
   gint expected_width[] = { 640, 1280, 1920 };
   gint expected_height[] = { 360, 720, 1080 };
-  gchar *expected_codecs[] = { "avc1.4d401f,ec+3", "avc1.4d4028,ec+3",
+  gchar const *expected_codecs[] = { "avc1.4d401f,ec+3", "avc1.4d4028,ec+3",
     "avc1.4d4029,ec+3"
   };
-  gchar *expected_media_name[] = { "English Track" };
-  gchar *expected_media_lang[] = { "en" };
-  gchar *expected_media_uri[] = {
+  gchar const *expected_media_name[] = { "English Track" };
+  gchar const *expected_media_lang[] = { "en" };
+  gchar const *expected_media_uri[] = {
     "http://localhost/Audio_fMP4/Silent-Atmos_6ch_640kbps_ddp_joc_sub.m3u8"
   };
 

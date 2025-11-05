@@ -739,7 +739,10 @@ gst_h265_parser_parse_short_term_ref_pic_sets (GstH265ShortTermRefPicSet *
     RefRpsIdx = stRpsIdx - stRPS->delta_idx_minus1 - 1; /* 7-45 */
     deltaRps = (1 - 2 * stRPS->delta_rps_sign) * (stRPS->abs_delta_rps_minus1 + 1);     /* 7-46 */
 
+    CHECK_ALLOWED_MAX (RefRpsIdx, 64);
+
     RefRPS = &sps->short_term_ref_pic_set[RefRpsIdx];
+    CHECK_ALLOWED_MAX (RefRPS->NumDeltaPocs, 15);
 
     for (j = 0; j <= RefRPS->NumDeltaPocs; j++) {
       READ_UINT8 (nr, used_by_curr_pic_flag[j], 1);
@@ -748,6 +751,8 @@ gst_h265_parser_parse_short_term_ref_pic_sets (GstH265ShortTermRefPicSet *
     }
 
     /* 7-47: calcuate NumNegativePics, DeltaPocS0 and UsedByCurrPicS0 */
+    CHECK_ALLOWED_MAX (RefRPS->NumNegativePics, 15);
+    CHECK_ALLOWED_MAX (RefRPS->NumPositivePics, 15 - RefRPS->NumNegativePics);
     i = 0;
     for (j = (RefRPS->NumPositivePics - 1); j >= 0; j--) {
       dPoc = RefRPS->DeltaPocS1[j] + deltaRps;
@@ -768,6 +773,7 @@ gst_h265_parser_parse_short_term_ref_pic_sets (GstH265ShortTermRefPicSet *
         stRPS->UsedByCurrPicS0[i++] = used_by_curr_pic_flag[j];
       }
     }
+    CHECK_ALLOWED_MAX (i, 15);
     stRPS->NumNegativePics = i;
 
     /* 7-48: calcuate NumPositivePics, DeltaPocS1 and UsedByCurrPicS1 */
@@ -791,6 +797,7 @@ gst_h265_parser_parse_short_term_ref_pic_sets (GstH265ShortTermRefPicSet *
             used_by_curr_pic_flag[RefRPS->NumNegativePics + j];
       }
     }
+    CHECK_ALLOWED_MAX (i, 15 - stRPS->NumNegativePics);
     stRPS->NumPositivePics = i;
 
   } else {
@@ -799,8 +806,10 @@ gst_h265_parser_parse_short_term_ref_pic_sets (GstH265ShortTermRefPicSet *
       READ_UE_MAX (nr, stRPS->NumNegativePics,
           sps->max_dec_pic_buffering_minus1[sps->max_sub_layers_minus1]);
     } else {                    /* FIXME multi-layer */
-      READ_UE (nr, stRPS->NumNegativePics);
+      READ_UE_MAX (nr, stRPS->NumNegativePics, 15);
     }
+    /* num_negative_pics: 0 to MaxDpbSize - 1 */
+    CHECK_ALLOWED_MAX (stRPS->NumNegativePics, 15);
 
     /* 7-50 */
     if (!sps->multi_layer_ext_sps_flag) {
@@ -808,8 +817,10 @@ gst_h265_parser_parse_short_term_ref_pic_sets (GstH265ShortTermRefPicSet *
           (sps->max_dec_pic_buffering_minus1[sps->max_sub_layers_minus1] -
               stRPS->NumNegativePics));
     } else {                    /* FIXME multi-layer */
-      READ_UE (nr, stRPS->NumPositivePics);
+      READ_UE_MAX (nr, stRPS->NumPositivePics, 15 - stRPS->NumNegativePics);
     }
+    /* num_positive_pics: 0 to MaxDpbSize - 1 - num_negative_pics */
+    CHECK_ALLOWED_MAX (stRPS->NumPositivePics, 15 - stRPS->NumNegativePics);
 
     for (i = 0; i < stRPS->NumNegativePics; i++) {
       READ_UE_MAX (nr, delta_poc_s0_minus1[i], 32767);
@@ -846,6 +857,7 @@ gst_h265_parser_parse_short_term_ref_pic_sets (GstH265ShortTermRefPicSet *
 
   /* 7-57 */
   stRPS->NumDeltaPocs = stRPS->NumPositivePics + stRPS->NumNegativePics;
+  CHECK_ALLOWED_MAX (stRPS->NumDeltaPocs, 15);
 
   return TRUE;
 

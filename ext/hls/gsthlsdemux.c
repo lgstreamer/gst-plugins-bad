@@ -64,6 +64,8 @@ GST_DEBUG_CATEGORY (gst_hls_demux_debug);
 #define GST_M3U8_CLIENT_LOCK(l) /* FIXME */
 #define GST_M3U8_CLIENT_UNLOCK(l)       /* FIXME */
 
+#define MAX_RETRY_CNT 10
+
 /* GObject */
 static void gst_hls_demux_finalize (GObject * obj);
 
@@ -620,7 +622,7 @@ gst_hls_demux_stream_seek (GstAdaptiveDemuxStream * stream, gboolean forward,
   /* Snap to segment boundary. Improves seek performance on slow machines. */
   snap_nearest =
       (flags & GST_SEEK_FLAG_SNAP_NEAREST) == GST_SEEK_FLAG_SNAP_NEAREST;
-  snap_after = ! !(flags & GST_SEEK_FLAG_SNAP_AFTER);
+  snap_after = !!(flags & GST_SEEK_FLAG_SNAP_AFTER);
 
   GST_M3U8_CLIENT_LOCK (hlsdemux->client);
   /* FIXME: Here we need proper discont handling */
@@ -752,25 +754,28 @@ create_stream_for_playlist (GstAdaptiveDemux * demux, GstM3U8 * playlist,
 
     if (!is_primary_playlist)
       hlsdemux_stream->media = gst_hls_media_ref (media);
-    GstSample *sample;
-    GstBuffer *buf = gst_buffer_new ();
-    sample = gst_sample_new (buf, NULL, NULL,
-        gst_structure_new ("hls-media-tag",
-            "name", G_TYPE_STRING, media->name,
-            "language", G_TYPE_STRING, media->lang,
-            "channels", G_TYPE_INT, media->channels,
-            "default", G_TYPE_BOOLEAN, media->is_default,
-            "track-order", G_TYPE_INT, media->track_order, NULL));
-    gst_buffer_unref (buf);
 
-    GST_LOG_OBJECT (stream->pad,
-        "Adding #EXT-X-MEDIA attributes to taglist. name: %s, language: %s, channels: %d, default: %d track-order: %d",
-        media->name, media->lang, media->channels, media->is_default,
-        media->track_order);
+    {
+      GstSample *sample;
+      GstBuffer *buf = gst_buffer_new ();
+      sample = gst_sample_new (buf, NULL, NULL,
+          gst_structure_new ("hls-media-tag",
+              "name", G_TYPE_STRING, media->name,
+              "language", G_TYPE_STRING, media->lang,
+              "channels", G_TYPE_INT, media->channels,
+              "default", G_TYPE_BOOLEAN, media->is_default,
+              "track-order", G_TYPE_INT, media->track_order, NULL));
+      gst_buffer_unref (buf);
 
-    gst_tag_list_add (tags, GST_TAG_MERGE_KEEP,
-        GST_TAG_APPLICATION_DATA, sample, NULL);
-    gst_sample_unref (sample);
+      GST_LOG_OBJECT (stream->pad,
+          "Adding #EXT-X-MEDIA attributes to taglist. name: %s, language: %s, channels: %d, default: %d track-order: %d",
+          media->name, media->lang, media->channels, media->is_default,
+          media->track_order);
+
+      gst_tag_list_add (tags, GST_TAG_MERGE_KEEP,
+          GST_TAG_APPLICATION_DATA, sample, NULL);
+      gst_sample_unref (sample);
+    }
 
     gst_adaptive_demux_stream_set_tags (stream, tags);
 
@@ -882,8 +887,6 @@ gst_hls_demux_set_current_variant (GstHLSDemux * hlsdemux,
     for (walk = ad_demux->streams; walk != NULL; walk = walk->next) {
       GstAdaptiveDemuxStream *ad_stream = walk->data;
       GstHLSDemuxStream *hls_stream = GST_HLS_DEMUX_STREAM_CAST (ad_stream);
-      GstStreamType stream_type =
-          gst_stream_get_stream_type (ad_stream->object);
       GstM3U8 *m3u8 = gst_hls_demux_stream_get_m3u8 (hls_stream);
 
       if (hls_stream->stream_type != GST_HLS_TSREADER_FMP4) {
@@ -1062,6 +1065,20 @@ gst_hls_demux_process_manifest (GstAdaptiveDemux * demux, GstBuffer * buf)
     }
   }
   GST_M3U8_CLIENT_UNLOCK (self);
+
+  /* NOTE: Supporting ad-markers for VOD only */
+  if (!gst_hls_demux_is_live (demux) && variant) {
+    gboolean notify = FALSE;
+    GstStructure *structure = NULL;
+
+    notify = gst_m3u8_get_ad_markers (variant->m3u8, "ad-markers", &structure);
+
+    if (notify && structure) {
+      GST_DEBUG_OBJECT (hlsdemux, "posting: %" GST_PTR_FORMAT, structure);
+      gst_element_post_message (GST_ELEMENT_CAST (demux),
+          gst_message_new_element (GST_OBJECT_CAST (demux), structure));
+    }
+  }
 
   return gst_hls_demux_setup_streams (demux, FALSE);
 }
@@ -1266,7 +1283,8 @@ caps_to_reader (const GstCaps * caps)
     return GST_HLS_TSREADER_MPEGTS;
   if (gst_structure_has_name (s, "application/x-id3"))
     return GST_HLS_TSREADER_ID3;
-  if (gst_structure_has_name (s, "video/quicktime"))
+  if (gst_structure_has_name (s, "video/quicktime") ||
+      gst_structure_has_name (s, "audio/x-m4a"))
     return GST_HLS_TSREADER_FMP4;
   if (gst_structure_has_name (s, "application/x-subtitle-vtt"))
     return GST_HLS_TSREADER_WEBVTT;
@@ -2561,6 +2579,7 @@ gst_hls_demux_update_playlist (GstHLSDemux * demux, gboolean update,
   GstM3U8 *m3u8;
   gchar *uri;
   gint i;
+  guint retry_cnt = 0;
 
 retry:
   uri = gst_m3u8_get_uri (demux->current_variant->m3u8);
@@ -2574,6 +2593,16 @@ retry:
 
     if (!update || main_checked || demux->master->is_simple
         || !gst_adaptive_demux_is_running (GST_ADAPTIVE_DEMUX_CAST (demux))) {
+      if (!update) {
+        if (retry_cnt < MAX_RETRY_CNT) {
+          GST_WARNING_OBJECT (demux, "retrying... attempt %d", retry_cnt + 1);
+          retry_cnt++;
+          g_clear_error (err);
+          goto retry;
+        } else {
+          GST_ERROR_OBJECT (demux, "Too many retry failures.");
+        }
+      }
       g_free (uri);
       return FALSE;
     }
@@ -2624,6 +2653,7 @@ retry:
     g_object_unref (download);
 
     main_checked = TRUE;
+    demux->master_reloaded = TRUE;
     goto retry;
   }
   g_free (uri);
@@ -2651,6 +2681,19 @@ retry:
     return FALSE;
   }
 
+  if (demux->master_reloaded) {
+    demux->master_reloaded = FALSE;
+    main_checked = TRUE;
+  }
+
+  if (main_checked && update) {
+    GST_DEBUG_OBJECT (demux,
+        "master playlist reloaded, try to update m3u8 in variant stream");
+    if (!gst_hls_demux_stream_update_playlist (demux, m3u8))
+      GST_WARNING_OBJECT (demux, "Couldn't find matching stream");
+  }
+
+
   if (!gst_m3u8_update (m3u8, playlist)) {
     if (gst_m3u8_is_live (m3u8)) {
       guint num_of_segments = g_list_length (m3u8->files);
@@ -2664,13 +2707,6 @@ retry:
     g_set_error (err, GST_STREAM_ERROR, GST_STREAM_ERROR_FAILED,
         "Couldn't update playlist");
     return FALSE;
-  }
-
-  if (gst_m3u8_is_live (m3u8) && main_checked && update) {
-    GST_DEBUG_OBJECT (demux,
-        "master playlist reloaded, try to update m3u8 in variant stream");
-    if (!gst_hls_demux_stream_update_playlist (demux, m3u8))
-      GST_WARNING_OBJECT (demux, "Couldn't find matching stream");
   }
 
   for (i = 0; i < GST_HLS_N_MEDIA_TYPES; ++i) {

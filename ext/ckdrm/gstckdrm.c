@@ -706,7 +706,7 @@ gst_ckdrm_set_property (GObject * object,
 gboolean
 plugin_init (GstPlugin * plugin)
 {
-  if (!gst_element_register (plugin, "ckdrm", GST_RANK_PRIMARY,
+  if (!gst_element_register (plugin, "ckdrm", GST_RANK_MARGINAL,
           gst_ckdrm_get_type ()))
     return FALSE;
 

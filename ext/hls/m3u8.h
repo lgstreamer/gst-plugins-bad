@@ -116,10 +116,11 @@ struct _GstM3U8MediaFile
   guint8 iv[16];
   gint64 offset, size;
   gint ref_count;               /* ATOMIC */
+  GstM3U8InitFile *init_file;   /* Media Initialization (hold ref) */
 
-  GstM3U8InitFile *init_file;   /* Media Initialization corresponding to
-                                 * current segment, if exist (hold ref) */
-
+  gboolean cue_out;
+  gboolean cue_in;
+  GstClockTime cue_out_duration;
 };
 
 GstM3U8MediaFile * gst_m3u8_media_file_ref   (GstM3U8MediaFile * mfile);
@@ -167,6 +168,10 @@ gboolean           gst_m3u8_is_live              (GstM3U8 * m3u8);
 gboolean           gst_m3u8_get_seek_range       (GstM3U8 * m3u8,
                                                   gint64  * start,
                                                   gint64  * stop);
+
+gboolean           gst_m3u8_get_ad_markers (GstM3U8 * m3u8,
+                                            const gchar * msg_name,
+                                            GstStructure ** structure);
 
 struct _GstHLSMedia {
   GstHLSMediaType mtype;

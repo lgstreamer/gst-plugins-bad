@@ -671,7 +671,6 @@ mpegts_base_program_add_stream (MpegTSBase * base,
       gst_stream_collection_add_stream (program->collection,
           (GstStream *) gst_object_ref (bstream->stream_object));
 
-
   return bstream;
 }
 
@@ -729,6 +728,35 @@ _pmt_stream_in_program (MpegTSBaseProgram * program,
 }
 
 static gboolean
+_stream_is_private_section (GstMpegtsPMTStream * stream)
+{
+  switch (stream->stream_type) {
+    case GST_MPEGTS_STREAM_TYPE_SCTE_DSMCC_DCB:
+    case GST_MPEGTS_STREAM_TYPE_SCTE_SIGNALING:
+    {
+      guint32 registration_id =
+          get_registration_from_descriptors (stream->descriptors);
+      /* Not a private section stream */
+      if (registration_id != DRF_ID_CUEI && registration_id != DRF_ID_ETV1)
+        return FALSE;
+    }
+    case GST_MPEGTS_STREAM_TYPE_PRIVATE_SECTIONS:
+    case GST_MPEGTS_STREAM_TYPE_MHEG:
+    case GST_MPEGTS_STREAM_TYPE_DSM_CC:
+    case GST_MPEGTS_STREAM_TYPE_DSMCC_A:
+    case GST_MPEGTS_STREAM_TYPE_DSMCC_B:
+    case GST_MPEGTS_STREAM_TYPE_DSMCC_C:
+    case GST_MPEGTS_STREAM_TYPE_DSMCC_D:
+    case GST_MPEGTS_STREAM_TYPE_SL_FLEXMUX_SECTIONS:
+    case GST_MPEGTS_STREAM_TYPE_METADATA_SECTIONS:
+      /* known PSI streams */
+      return TRUE;
+    default:
+      return FALSE;
+  }
+}
+
+static gboolean
 mpegts_base_update_program (MpegTSBase * base, MpegTSBaseProgram * program,
     GstMpegtsSection * section, const GstMpegtsPMT * pmt)
 {
@@ -775,6 +803,12 @@ mpegts_base_update_program (MpegTSBase * base, MpegTSBaseProgram * program,
         stream->stream = pmt_stream;
     } else {
       /* Remove old streams although pid and stream type are same */
+      if (_stream_is_private_section (stream->stream)) {
+        if (base->parse_private_sections)
+          MPEGTS_BIT_UNSET (base->known_psi, stream->pid);
+      } else
+        MPEGTS_BIT_UNSET (base->is_pes, stream->pid);
+
       toremove = g_list_prepend (toremove, stream);
       program->streams[stream->pid] = NULL;
       program->stream_list = g_list_remove_link (program->stream_list, tmp);
@@ -785,9 +819,25 @@ mpegts_base_update_program (MpegTSBase * base, MpegTSBaseProgram * program,
   nbstreams = pmt->streams->len;
   for (i = 0; i < nbstreams; i++) {
     GstMpegtsPMTStream *stream = g_ptr_array_index (pmt->streams, i);
-    if (!_pmt_stream_in_program (program, stream) || new_stream_id)
+    if (!_pmt_stream_in_program (program, stream) || new_stream_id) {
+      if (_stream_is_private_section (stream)) {
+        MPEGTS_BIT_SET (base->known_psi, stream->pid);
+      } else {
+        if (G_UNLIKELY (MPEGTS_BIT_IS_SET (base->is_pes, stream->pid)))
+          GST_FIXME
+              ("Refcounting issue. Setting twice a PID (0x%04x) as known PES",
+              stream->pid);
+        if (G_UNLIKELY (MPEGTS_BIT_IS_SET (base->known_psi, stream->pid))) {
+          GST_FIXME
+              ("Refcounting issue. Setting a known PSI PID (0x%04x) as known PES",
+              stream->pid);
+          MPEGTS_BIT_UNSET (base->known_psi, stream->pid);
+        }
+        MPEGTS_BIT_SET (base->is_pes, stream->pid);
+      }
       mpegts_base_program_add_stream (base, program, stream->pid,
           stream->stream_type, stream);
+    }
   }
 
   /* Call subclass update */
@@ -812,36 +862,6 @@ mpegts_base_update_program (MpegTSBase * base, MpegTSBaseProgram * program,
       klass->stream_removed (base, stream);
   }
   return TRUE;
-}
-
-
-static gboolean
-_stream_is_private_section (GstMpegtsPMTStream * stream)
-{
-  switch (stream->stream_type) {
-    case GST_MPEGTS_STREAM_TYPE_SCTE_DSMCC_DCB:
-    case GST_MPEGTS_STREAM_TYPE_SCTE_SIGNALING:
-    {
-      guint32 registration_id =
-          get_registration_from_descriptors (stream->descriptors);
-      /* Not a private section stream */
-      if (registration_id != DRF_ID_CUEI && registration_id != DRF_ID_ETV1)
-        return FALSE;
-    }
-    case GST_MPEGTS_STREAM_TYPE_PRIVATE_SECTIONS:
-    case GST_MPEGTS_STREAM_TYPE_MHEG:
-    case GST_MPEGTS_STREAM_TYPE_DSM_CC:
-    case GST_MPEGTS_STREAM_TYPE_DSMCC_A:
-    case GST_MPEGTS_STREAM_TYPE_DSMCC_B:
-    case GST_MPEGTS_STREAM_TYPE_DSMCC_C:
-    case GST_MPEGTS_STREAM_TYPE_DSMCC_D:
-    case GST_MPEGTS_STREAM_TYPE_SL_FLEXMUX_SECTIONS:
-    case GST_MPEGTS_STREAM_TYPE_METADATA_SECTIONS:
-      /* known PSI streams */
-      return TRUE;
-    default:
-      return FALSE;
-  }
 }
 
 /* Return TRUE if programs are equal */
@@ -1064,12 +1084,16 @@ mpegts_base_activate_program (MpegTSBase * base, MpegTSBaseProgram * program,
       }
       MPEGTS_BIT_SET (base->is_pes, stream->pid);
     }
+    g_mutex_lock (&base->expose_lock);
     mpegts_base_program_add_stream (base, program,
         stream->pid, stream->stream_type, stream);
+    g_mutex_unlock (&base->expose_lock);
   }
   /* We add the PCR pid last. If that PID is already used by one of the media
    * streams above, no new stream will be created */
+  g_mutex_lock (&base->expose_lock);
   mpegts_base_program_add_stream (base, program, pmt->pcr_pid, -1, NULL);
+  g_mutex_unlock (&base->expose_lock);
   MPEGTS_BIT_SET (base->is_pes, pmt->pcr_pid);
 
   program->active = TRUE;
@@ -1246,6 +1270,7 @@ mpegts_base_apply_pmt (MpegTSBase * base, GstMpegtsSection * section)
   if (G_UNLIKELY (old_program == NULL))
     goto no_program;
 
+#if 0
   if (base->real_time && base->streams_aware
       && mpegts_base_is_program_update (base, old_program, section->pid, pmt)) {
     GST_FIXME ("We are streams_aware and new program is an update");
@@ -1255,6 +1280,7 @@ mpegts_base_apply_pmt (MpegTSBase * base, GstMpegtsSection * section)
     g_mutex_unlock (&base->expose_lock);
     goto beach;
   }
+#endif
 
   if (G_UNLIKELY (mpegts_base_is_same_program (base, old_program, section->pid,
               pmt)))

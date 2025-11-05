@@ -89,7 +89,7 @@ static gboolean gst_basedrm_parse_protection_header (GstBaseDrm * drm,
 static gboolean gst_basedrm_setup_license (GstBaseDrm * basedrm,
     guint8 * header, guint size);
 static void gst_basedrm_free_xml_data (GstContentProtection *
-    content_protection_data);
+    content_protection_data, GstDRMSystemInfo * drm_system_info);
 static gboolean gst_basedrm_get_xml_node_content (xmlNode * a_node,
     gchar ** content);
 static gboolean gst_basedrm_get_xml_prop_string (xmlNode * a_node,
@@ -184,7 +184,7 @@ gst_basedrm_decrypt_default (GstBaseDrm * basedrm,
 
 static gboolean
 gst_basedrm_resolve_custom_pssi_default (GstBaseDrm * basedrm,
-    gchar * custom_pssi, guint8 ** header, guint * size)
+    gchar * custom_pssi, guint8 ** header, guint * size, gboolean * ignore)
 {
   return TRUE;
 }
@@ -199,6 +199,21 @@ static gboolean
 gst_basedrm_stop_default (GstBaseDrm * basedrm)
 {
   return FALSE;
+}
+
+static gboolean
+gst_basedrm_restore_original_pssh_default (GstBaseDrm * basedrm,
+    guint8 * original_pssh, guint original_pssh_size, guint8 ** data,
+    guint * data_size)
+{
+  return TRUE;
+}
+
+static gboolean
+gst_basedrm_set_video_info_default (GstBaseDrm * basedrm, guint32 width,
+    guint32 height)
+{
+  return TRUE;
 }
 
 GType
@@ -266,13 +281,33 @@ gst_basedrm_class_init (GstBaseDrmClass * klass)
   klass->decrypt = GST_DEBUG_FUNCPTR (gst_basedrm_decrypt_default);
   klass->resolve_custom_pssi =
       GST_DEBUG_FUNCPTR (gst_basedrm_resolve_custom_pssi_default);
-  klass->get_key_info =
-      GST_DEBUG_FUNCPTR (gst_basedrm_get_key_info_default);
+  klass->get_key_info = GST_DEBUG_FUNCPTR (gst_basedrm_get_key_info_default);
   klass->stop = GST_DEBUG_FUNCPTR (gst_basedrm_stop_default);
+  klass->restore_original_pssh =
+      GST_DEBUG_FUNCPTR (gst_basedrm_restore_original_pssh_default);
+  klass->set_video_info =
+      GST_DEBUG_FUNCPTR (gst_basedrm_set_video_info_default);
 
   if (basedrm_mutex_init == 0) {
     g_mutex_init (&basedrm_mutex);
     basedrm_mutex_init = 1;
+  }
+}
+
+static void
+sink_pad_linked_cb (GstPad * pad, GstPad * peer, GstBaseDrm * basedrm)
+{
+  GstDRMSystemInfo *drm_system_info = &basedrm->drm_system_info;
+
+  GST_DEBUG_OBJECT (basedrm, "sinkpad linked");
+
+  g_free (drm_system_info->drmclient_id);
+  gst_element_get_smart_properties (GST_ELEMENT_CAST (basedrm),
+      "drm-clientid", &drm_system_info->drmclient_id, NULL);
+
+  if (drm_system_info->drmclient_id) {
+    GST_INFO_OBJECT (basedrm, "drm-clientid: %s",
+        drm_system_info->drmclient_id);
   }
 }
 
@@ -296,6 +331,10 @@ gst_basedrm_init (GstBaseDrm * basedrm)
   drm_system_info->xml_node_name = NULL;
   drm_system_info->drmclient_id = NULL;
   drm_system_info->is_svp = FALSE;
+  drm_system_info->license_type = NULL;
+  drm_system_info->content_id = NULL;
+  drm_system_info->license_url = NULL;
+  drm_system_info->group_license_url = NULL;
   drm_license_info->ack = NULL;
   drm_license_info->ack_response = NULL;
   drm_license_info->challenge = NULL;
@@ -305,6 +344,9 @@ gst_basedrm_init (GstBaseDrm * basedrm)
   rights_error_info->content_id = g_strdup ("unknown");
   rights_error_info->drm_system_id = g_strdup ("unknown");
   rights_error_info->rights_issuer_url = g_strdup ("unknown");
+
+  g_signal_connect (G_OBJECT (GST_BASE_TRANSFORM (basedrm)->sinkpad), "linked",
+      G_CALLBACK (sink_pad_linked_cb), basedrm);
 }
 
 static gboolean
@@ -373,6 +415,26 @@ gst_basedrm_stop (GstBaseTransform * trans)
     drm_system_info->drmclient_id = NULL;
   }
 
+  if (drm_system_info->license_type) {
+    g_free (drm_system_info->license_type);
+    drm_system_info->license_type = NULL;
+  }
+
+  if (drm_system_info->content_id) {
+    g_free (drm_system_info->content_id);
+    drm_system_info->content_id = NULL;
+  }
+
+  if (drm_system_info->license_url) {
+    g_free (drm_system_info->license_url);
+    drm_system_info->license_url = NULL;
+  }
+
+  if (drm_system_info->group_license_url) {
+    g_free (drm_system_info->group_license_url);
+    drm_system_info->group_license_url = NULL;
+  }
+
   rights_error_info->error_state = RIGHTS_ERROR_NONE;
   g_free (rights_error_info->content_id);
   g_free (rights_error_info->drm_system_id);
@@ -419,6 +481,9 @@ gst_basedrm_transform_caps (GstBaseTransform * base,
   GstDRMSystemInfo *drm_system_info = &basedrm->drm_system_info;
   GstCaps *new_caps = NULL;
   gint i, j;
+  const GValue *value;
+  guint32 width = 0;
+  guint32 height = 0;
 
   g_return_val_if_fail (direction != GST_PAD_UNKNOWN, NULL);
   new_caps = gst_caps_new_empty ();
@@ -452,6 +517,21 @@ gst_basedrm_transform_caps (GstBaseTransform * base,
 
       gst_structure_set_name (out,
           gst_structure_get_string (out, "original-media-type"));
+
+      if (gst_structure_has_field (in, "width")) {
+        value = gst_structure_get_value (in, "width");
+        width = g_value_get_int (value);
+      }
+
+      if (gst_structure_has_field (in, "height")) {
+        value = gst_structure_get_value (in, "height");
+        height = g_value_get_int (value);
+      }
+
+      if (width != 0 && height != 0) {
+        GST_DEBUG_OBJECT (basedrm, "width [%d] height[%d]", width, height);
+        basedrm_class->set_video_info (basedrm, width, height);
+      }
 
       /* filter out the DRM related fields from the down-stream caps */
       for (j = 0; j < n_fields; ++j) {
@@ -545,6 +625,12 @@ gst_basedrm_decrypt_init (GstBaseDrm * basedrm, GBytes * iv)
     GST_ERROR_OBJECT (basedrm, "set IV problem");
     res = FALSE;
   }
+
+  if (basedrm_class->prepare_decrypt (basedrm) == FALSE) {
+    GST_ERROR_OBJECT (basedrm, "Failed to prepare decrypt context");
+    res = FALSE;
+  }
+
   return res;
 }
 
@@ -867,10 +953,6 @@ gst_basedrm_acquire_license (GstBaseDrm * basedrm)
     goto Error;
   }
 
-  if (basedrm_class->prepare_decrypt (basedrm) == FALSE) {
-    GST_ERROR_OBJECT (basedrm, "Failed to prepare decrypt context");
-    goto Error;
-  }
   res = TRUE;
 
 Error:
@@ -923,13 +1005,13 @@ Error:
  * it carries Protection System Specific Information (pssi)
  * e.g. DRM header objectm, Key ID */
 static gboolean
-gst_basedrm_parse_pssh_box (GstBaseDrm * basedrm, GstBuffer * pssh)
+gst_basedrm_parse_pssh_box (GstBaseDrm * basedrm, GstBuffer * pssh,
+    guint8 ** data, guint * data_size)
 {
+  GstBaseDrmClass *basedrm_class = GST_BASEDRM_GET_CLASS (basedrm);
   GstMapInfo info;
   GstByteReader br;
   guint8 version;
-  guint8 *data;
-  guint data_size;
   gboolean ret = FALSE;
   GstStructure *encrypted_structure;
   GstMessage *encrypted_message;
@@ -977,14 +1059,12 @@ gst_basedrm_parse_pssh_box (GstBaseDrm * basedrm, GstBuffer * pssh)
   }
 
   /* Parse Data */
-  data_size = gst_byte_reader_get_uint32_be_unchecked (&br);
-  GST_DEBUG_OBJECT (basedrm, "pssh data size: %u", data_size);
-  data = (guint8 *) gst_byte_reader_get_data_unchecked (&br, data_size);
+  *data_size = gst_byte_reader_get_uint32_be_unchecked (&br);
+  GST_DEBUG_OBJECT (basedrm, "pssh data size: %u", *data_size);
+  *data = (guint8 *) gst_byte_reader_get_data_unchecked (&br, *data_size);
 
-  if (gst_basedrm_setup_license (basedrm, data, data_size) == FALSE) {
-    GST_ERROR_OBJECT (basedrm, "Failed to setup license");
-    goto beach;
-  }
+  basedrm_class->restore_original_pssh (basedrm, info.data, info.size, data,
+      data_size);
 
   ret = TRUE;
 
@@ -994,7 +1074,8 @@ beach:
 }
 
 static void
-gst_basedrm_free_xml_data (GstContentProtection * content_protection_data)
+gst_basedrm_free_xml_data (GstContentProtection * content_protection_data,
+    GstDRMSystemInfo * drm_system_info)
 {
   if (content_protection_data) {
     if (content_protection_data->schemeIdUri)
@@ -1006,6 +1087,23 @@ gst_basedrm_free_xml_data (GstContentProtection * content_protection_data)
     if (content_protection_data->data)
       xmlFree (content_protection_data->data);
     g_free (content_protection_data);
+  }
+
+  if (drm_system_info->license_type) {
+    xmlFree (drm_system_info->license_type);
+    drm_system_info->license_type = NULL;
+  }
+  if (drm_system_info->content_id) {
+    xmlFree (drm_system_info->content_id);
+    drm_system_info->content_id = NULL;
+  }
+  if (drm_system_info->license_url) {
+    xmlFree (drm_system_info->license_url);
+    drm_system_info->license_url = NULL;
+  }
+  if (drm_system_info->group_license_url) {
+    xmlFree (drm_system_info->group_license_url);
+    drm_system_info->group_license_url = NULL;
   }
 }
 
@@ -1106,6 +1204,8 @@ gst_basedrm_parse_content_protection_element (GstBaseDrm * basedrm,
   xmlNode *root_element = NULL, *cur_node = NULL;
   gboolean ret = FALSE;
   guint8 *decodec_data = NULL;
+  guint8 *init_data = NULL;
+  guint init_data_len = 0;
   guint data_len = 0;
   gchar *drmclient_id = NULL;
   gsize drmclient_id_len = 0;
@@ -1115,6 +1215,8 @@ gst_basedrm_parse_content_protection_element (GstBaseDrm * basedrm,
   GST_DEBUG_OBJECT (basedrm, "Content Protection element from DASH demux");
 
   gst_buffer_map (pssi, &info, GST_MAP_READ);
+
+  GST_DEBUG_OBJECT (basedrm, "ContentProtection tag:\n %s", info.data);
   /* FIXME: drmclient_id is temporarily appended after ContentProtection
    * xml element for proactive license acquisition support. Following codes
    * will be unnecessary if drmclient_id is passed as a xml element in
@@ -1122,12 +1224,12 @@ gst_basedrm_parse_content_protection_element (GstBaseDrm * basedrm,
   if (info.data[info.size - 1] != '>') {
     drmclient_id = g_strrstr_len ((const char *) info.data, info.size, ">") + 1;
     drmclient_id_len = info.data + info.size - (guint8 *) drmclient_id;
+    g_free (drm_system_info->drmclient_id);
     drm_system_info->drmclient_id = g_strndup ((const char *) drmclient_id,
         drmclient_id_len);
     GST_DEBUG_OBJECT (basedrm, "drmclient_id = %s",
         drm_system_info->drmclient_id);
   }
-
   /* this initialize the library and check potential ABI mismatches
    * between the version it was compiled for and the actual shared
    * library used
@@ -1136,6 +1238,7 @@ gst_basedrm_parse_content_protection_element (GstBaseDrm * basedrm,
       /* parse "data" into a document (which is a libxml2 tree structure xmlDoc) */
       doc = xmlReadMemory ((const char *) info.data,
       info.size - drmclient_id_len, "ContentProtection.xml", NULL, 0);
+
   if (!doc) {
     GST_ERROR_OBJECT (basedrm, "Failed to parse XML from pssi event");
     goto beach;
@@ -1158,23 +1261,30 @@ gst_basedrm_parse_content_protection_element (GstBaseDrm * basedrm,
     GST_ERROR_OBJECT (basedrm, "invalid schemeIdUri");
     goto beach;
   }
+
   gst_basedrm_get_xml_prop_string (root_element, "value",
       &content_protection_data->value);
   gst_basedrm_get_xml_prop_string (root_element, "cenc:default_KID",
       &content_protection_data->KID);
+  GST_DEBUG_OBJECT (basedrm, "cenc:default_KID = %s",
+      content_protection_data->KID);
 
   for (cur_node = root_element->children; cur_node; cur_node = cur_node->next) {
     gboolean xmlns_cenc_used = FALSE;
+    gboolean xmlns_dashif_used = FALSE;
 
     if (cur_node->type != XML_ELEMENT_NODE)
       continue;
 
-    /* Check whether current node has xmlns:cenc or not. */
+    /* Check whether current node has xmlns:cenc or xmlns:dashif or not. */
     for (xmlNs * xmlns = cur_node->ns; xmlns; xmlns = xmlns->next) {
-      if (xmlns->prefix
-          && xmlStrEqual (xmlns->prefix, (const xmlChar *) "cenc")) {
+      GST_DEBUG_OBJECT (basedrm, "xmlns->prefix: %s", xmlns->prefix);
+      if (!xmlns->prefix)
+        continue;
+      if (xmlStrEqual (xmlns->prefix, (const xmlChar *) "cenc")) {
         xmlns_cenc_used = TRUE;
-        break;
+      } else if (xmlStrEqual (xmlns->prefix, (const xmlChar *) "dashif")) {
+        xmlns_dashif_used = TRUE;
       }
     }
 
@@ -1191,6 +1301,8 @@ gst_basedrm_parse_content_protection_element (GstBaseDrm * basedrm,
       GST_DEBUG_OBJECT (basedrm, "cenc:pssh = %s",
           content_protection_data->data);
 
+      g_free (decodec_data);
+
       decodec_data =
           (guint8 *) g_base64_decode (content_protection_data->data,
           (gsize *) & data_len);
@@ -1200,42 +1312,93 @@ gst_basedrm_parse_content_protection_element (GstBaseDrm * basedrm,
         goto beach;
       }
 
-      buffer = gst_buffer_new_wrapped (decodec_data, data_len);
-      if (gst_basedrm_parse_pssh_box (basedrm, buffer) == FALSE) {
+      buffer =
+          gst_buffer_new_wrapped (g_memdup (decodec_data, data_len), data_len);
+
+      if (gst_basedrm_parse_pssh_box (basedrm, buffer, &init_data,
+              &init_data_len) == FALSE) {
         GST_ERROR_OBJECT (basedrm, "Failed to parse pssh box");
         goto beach;
       }
-      break;
+    } else if ((xmlns_dashif_used
+            && xmlStrEqual (cur_node->name, (xmlChar *) "Laurl"))
+        || xmlStrEqual (cur_node->name, (xmlChar *) "dashif:Laurl")) {
+
+      GST_DEBUG_OBJECT (basedrm, "xmlns_dashif_used: %s , cur_node->name: %s",
+          xmlns_dashif_used ? "true" : "false", cur_node->name);
+      gst_basedrm_get_xml_prop_string (cur_node, "licenseType",
+          &drm_system_info->license_type);
+
+      if (!drm_system_info->license_type) {
+        GST_DEBUG_OBJECT (basedrm,
+            "dashif:Laurl licenseType value doesn't exist");
+        continue;
+      }
+
+      GST_DEBUG_OBJECT (basedrm, "licenseType: %s",
+          drm_system_info->license_type);
+
+      if (g_strcmp0 (drm_system_info->license_type, "contentId-1.0") == 0) {
+        gst_basedrm_get_xml_node_content (cur_node,
+            &drm_system_info->content_id);
+        GST_DEBUG_OBJECT (basedrm, "URL: %s", drm_system_info->content_id);
+      } else if (g_strcmp0 (drm_system_info->license_type, "license-1.0") == 0) {
+        gst_basedrm_get_xml_node_content (cur_node,
+            &drm_system_info->license_url);
+        GST_DEBUG_OBJECT (basedrm, "URL: %s", drm_system_info->license_type);
+      } else if (g_strcmp0 (drm_system_info->license_type,
+              "groupLicense-1.0") == 0) {
+        gst_basedrm_get_xml_node_content (cur_node,
+            &drm_system_info->group_license_url);
+        GST_DEBUG_OBJECT (basedrm, "URL: %s",
+            drm_system_info->group_license_url);
+      }
     } else {
+      gboolean ignore = TRUE;
+      guint8 *pssi_data = NULL;
+      guint pssi_data_len = 0;
+
       /* for custom pssi usage (e.g., playready mspr:pro, ..) */
       gst_basedrm_get_xml_node_as_string (cur_node,
           &content_protection_data->data);
       GST_DEBUG_OBJECT (basedrm, "custom pssi = %s",
           content_protection_data->data);
+
       if (basedrm_class->resolve_custom_pssi (basedrm,
-              content_protection_data->data, &decodec_data,
-              &data_len) == FALSE) {
+              content_protection_data->data, &pssi_data,
+              &pssi_data_len, &ignore) == FALSE) {
         GST_ERROR_OBJECT (basedrm, "Failed to resolve custom pssi");
         goto beach;
       }
 
-      if (gst_basedrm_setup_license (basedrm, decodec_data, data_len) == FALSE) {
-        GST_ERROR_OBJECT (basedrm, "Failed to setup license");
-        goto beach;
+      /* if xml node has content protection box, ignore flag is changed to FALSE, */
+      /* and init_data will reference current node's data */
+      if (!ignore && pssi_data != NULL) {
+        g_free (decodec_data);
+        init_data = decodec_data = pssi_data;
+        init_data_len = pssi_data_len;
+        break;
       }
-      break;
+      GST_DEBUG_OBJECT (basedrm, "ignore custom pssi: %s",
+          content_protection_data->data);
+      g_free (pssi_data);
     }
   }
+
+  if (init_data != NULL &&
+      gst_basedrm_setup_license (basedrm, init_data, init_data_len) == FALSE) {
+    GST_ERROR_OBJECT (basedrm, "Failed to setup license");
+    goto beach;
+  }
+
   ret = TRUE;
 
 beach:
   if (buffer) {
     gst_buffer_unref (buffer);
-  } else {
-    if (decodec_data)
-      g_free (decodec_data);
   }
-  gst_basedrm_free_xml_data (content_protection_data);
+  g_free (decodec_data);
+  gst_basedrm_free_xml_data (content_protection_data, drm_system_info);
   if (doc)
     xmlFreeDoc (doc);
   gst_buffer_unmap (pssi, &info);
@@ -1249,6 +1412,8 @@ gst_basedrm_sink_event_handler (GstBaseTransform * trans, GstEvent * event)
   const gchar *system_id;
   GstBuffer *pssi = NULL;
   const gchar *loc;
+  guint8 *data;
+  guint data_size;
   GstBaseDrm *basedrm = GST_BASEDRM (trans);
 
   switch (GST_EVENT_TYPE (event)) {
@@ -1272,7 +1437,10 @@ gst_basedrm_sink_event_handler (GstBaseTransform * trans, GstEvent * event)
         ret = gst_basedrm_parse_content_protection_element (basedrm, pssi);
       } else if (g_str_has_prefix (loc, "isobmff/")) {
         GST_DEBUG_OBJECT (basedrm, "event carries pssh data from qtdemux");
-        ret = gst_basedrm_parse_pssh_box (basedrm, pssi);
+        ret = gst_basedrm_parse_pssh_box (basedrm, pssi, &data, &data_size);
+        if (ret) {
+          ret = gst_basedrm_setup_license (basedrm, data, data_size);
+        }
       } else if (g_str_has_prefix (loc, "smooth-streaming")) {
         GST_DEBUG_OBJECT (basedrm,
             "event carries protection header from mssdemux");
@@ -1385,7 +1553,8 @@ gst_basedrm_parse_protection_header (GstBaseDrm * basedrm, GstBuffer * pssi)
 {
   gboolean ret = FALSE;
   GstMapInfo info;
-  gchar *uri = NULL;
+  guint8 *uri = NULL;
+  guint length = 0;
   gchar *attribute, *value;
 
   gst_buffer_map (pssi, &info, GST_MAP_READ);
@@ -1397,12 +1566,13 @@ gst_basedrm_parse_protection_header (GstBaseDrm * basedrm, GstBuffer * pssi)
       if (!gst_basedrm_uri_is_valid (value)) {
         goto beach;
       }
-      uri = g_strdup (value);
+      length = strlen (value);
+      uri = g_memdup (value, length);
       break;
     }
   }
 
-  if (!uri || gst_basedrm_setup_license (basedrm, uri, strlen (uri)) == FALSE) {
+  if (!uri || gst_basedrm_setup_license (basedrm, uri, length) == FALSE) {
     GST_ERROR_OBJECT (basedrm, "Failed to setup license");
     goto beach;
   }

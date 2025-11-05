@@ -235,6 +235,8 @@ struct _GstAdaptiveDemuxPrivate
    * without needing to stop tasks when they just want to
    * update the segment boundaries */
   GMutex segment_lock;
+
+  GstClockTime manifest_duration_cache;
 };
 
 typedef struct _GstAdaptiveDemuxTimer
@@ -951,6 +953,9 @@ gst_adaptive_demux_sink_event (GstPad * pad, GstObject * parent,
                   "manifest-live", G_TYPE_BOOLEAN,
                   gst_adaptive_demux_is_live (demux), NULL)));
 
+      /* Initialize duration cache */
+      demux->priv->manifest_duration_cache = GST_CLOCK_TIME_NONE;
+
       if (ret) {
         /* Send duration message */
         if (!gst_adaptive_demux_is_live (demux)) {
@@ -962,6 +967,7 @@ gst_adaptive_demux_sink_event (GstPad * pad, GstObject * parent,
                 GST_TIME_ARGS (duration));
             gst_element_post_message (GST_ELEMENT (demux),
                 gst_message_new_duration_changed (GST_OBJECT (demux)));
+            demux->priv->manifest_duration_cache = duration;
           } else {
             GST_DEBUG_OBJECT (demux,
                 "media duration unknown, can not send the duration message");
@@ -2119,13 +2125,9 @@ gst_adaptive_demux_handle_seek_event (GstAdaptiveDemux * demux, GstPad * pad,
         stop_type);
     gst_adaptive_demux_start_tasks (demux, TRUE);
   } else {
-    GList *iter;
     GstClockTime period_start =
         gst_adaptive_demux_get_period_start_time (demux);
     gboolean resume_preroll = demux->prepared_streams ? TRUE : FALSE;
-
-    /* If demux has prepared_streams now, it means that demux is still doing preroll */
-    iter = resume_preroll ? demux->prepared_streams : demux->streams;
 
     GST_ADAPTIVE_DEMUX_SEGMENT_LOCK (demux);
     gst_adaptive_demux_update_streams_segment (demux, demux->streams,
@@ -2265,6 +2267,17 @@ gst_adaptive_demux_src_query (GstPad * pad, GstObject * parent,
         if (GST_CLOCK_TIME_IS_VALID (duration) && duration > 0) {
           gst_query_set_duration (query, GST_FORMAT_TIME, duration);
           ret = TRUE;
+          demux->priv->manifest_duration_cache = duration;
+        } else if (GST_CLOCK_TIME_IS_VALID (demux->
+                priv->manifest_duration_cache)
+            && demux->priv->manifest_duration_cache > 0) {
+          GST_LOG_OBJECT (demux,
+              "return GST_QUERY_DURATION using cache %" GST_TIME_FORMAT,
+              GST_TIME_ARGS (demux->priv->manifest_duration_cache));
+          gst_query_set_duration (query, GST_FORMAT_TIME,
+              demux->priv->manifest_duration_cache);
+          ret = TRUE;
+          duration = demux->priv->manifest_duration_cache;
         }
       }
 
@@ -2297,7 +2310,8 @@ gst_adaptive_demux_src_query (GstPad * pad, GstObject * parent,
 
         ret = TRUE;
         if (can_seek) {
-          if (gst_adaptive_demux_is_live (demux)) {
+          if (gst_adaptive_demux_is_live (demux)
+              && demux->priv->manifest_duration_cache == GST_CLOCK_TIME_NONE) {
             ret = gst_adaptive_demux_get_live_seek_range (demux, &start, &stop);
             if (!ret) {
               // GST_MANIFEST_UNLOCK (demux);
@@ -2308,6 +2322,14 @@ gst_adaptive_demux_src_query (GstPad * pad, GstObject * parent,
             duration = demux_class->get_duration (demux);
             if (GST_CLOCK_TIME_IS_VALID (duration) && duration > 0)
               stop = duration;
+            else if (GST_CLOCK_TIME_IS_VALID (demux->
+                  priv->manifest_duration_cache)
+              && demux->priv->manifest_duration_cache > 0) {
+              GST_LOG_OBJECT (demux,
+                  "return GST_QUERY_SEEKING using cache %" GST_TIME_FORMAT,
+                  GST_TIME_ARGS (demux->priv->manifest_duration_cache));
+              stop = demux->priv->manifest_duration_cache;
+            }
           }
         }
         gst_query_set_seeking (query, fmt, can_seek, start, stop);
@@ -4401,8 +4423,13 @@ end_of_manifest:
             "Stream is EOS, but we're switching fragments. Not sending.");
       }
     } else {
-      GST_ERROR_OBJECT (demux, "Can't push EOS on non-exposed pad");
-      goto download_error;
+      if (gst_adaptive_demux_is_live (demux)) {
+        GST_WARNING_OBJECT (demux,
+            "Can't push EOS on non-exposed pad. Probably switching fragments.");
+      } else {
+        GST_ERROR_OBJECT (demux, "Can't push EOS on non-exposed pad");
+        goto download_error;
+      }
     }
   }
 

@@ -157,11 +157,17 @@ struct _GstDRMLicenseInfo
  */
 struct _GstDRMSystemInfo
 {
-  GList *system_ids;             /* protection system ID */
+  GList *system_ids;            /* protection system ID */
   guint8 *soap_action;          /* SOAPAction intent uri */
   guint8 *xml_node_name;        /* XML node name */
   gchar *drmclient_id;          /* drmclient id for custom data processing */
   gboolean is_svp;              /* svp flag for decryption */
+
+  /* license acquisition info for ATSC3.0 US */
+  gchar *license_type;
+  gchar *content_id;
+  gchar *license_url;
+  gchar *group_license_url;
 };
 
 /**
@@ -293,11 +299,15 @@ struct _GstBaseDrmClass
 
     gboolean (*decrypt) (GstBaseDrm * basedrm, GstDecryptInfo * decrypt_info);
 
-    gboolean (*resolve_custom_pssi) (GstBaseDrm * basedrm, gchar * custom_pssi, guint8 ** header, guint * size);
+    gboolean (*resolve_custom_pssi) (GstBaseDrm * basedrm, gchar * custom_pssi, guint8 ** header, guint * size, gboolean *ignore);
 
     GstBuffer * (*get_key_info) (GstBaseDrm * basedrm);
 
     gboolean (*stop) (GstBaseDrm * basedrm);
+
+    gboolean (*restore_original_pssh) (GstBaseDrm * basedrm, guint8 * orignal_pssh, guint origianl_pssh_size, guint8 ** data, guint *data_size);
+
+    gboolean (*set_video_info) (GstBaseDrm * basedrm, guint32 width, guint32 height);
 };
 
 GST_EXPORT

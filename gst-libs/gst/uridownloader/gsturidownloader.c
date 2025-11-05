@@ -27,6 +27,8 @@
 #define GST_CAT_DEFAULT uridownloader_debug
 GST_DEBUG_CATEGORY (uridownloader_debug);
 
+#define DEFAULT_TIMEOUT 5
+
 struct _GstUriDownloaderPrivate
 {
   /* Fragments fetcher */
@@ -478,6 +480,8 @@ gst_uri_downloader_set_uri (GstUriDownloader * downloader, const gchar * uri,
     g_object_set (downloader->priv->urisrc, "user-agent", user_agent, NULL);
   if (cookies && g_object_class_find_property (gobject_class, "cookies"))
     g_object_set (downloader->priv->urisrc, "cookies", cookies, NULL);
+  if (g_object_class_find_property (gobject_class, "timeout"))
+    g_object_set (downloader->priv->urisrc, "timeout", DEFAULT_TIMEOUT, NULL);
   if (g_object_class_find_property (gobject_class, "extra-headers")) {
     if (referer || refresh || !allow_cache) {
       GstStructure *extra_headers = gst_structure_new_empty ("headers");

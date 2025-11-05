@@ -179,6 +179,8 @@ struct _GstHLSDemux
   gchar *drm_systemid;
   GModule *module_drmcontroller;
   void *drm_ctrl_handle;
+
+  gboolean master_reloaded;
 };
 
 struct _GstHLSDemuxClass

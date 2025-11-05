@@ -1853,6 +1853,8 @@ gst_h265_parse_update_src_caps (GstH265Parse * h265parse, GstCaps * caps)
       if (level != NULL)
         gst_caps_set_simple (caps, "level", G_TYPE_STRING, level, NULL);
 
+      gst_caps_set_simple (caps, "hdr-type", G_TYPE_UINT,
+          sps->vui_params.transfer_characteristics, NULL);
       /* relax the profile constraint to find a suitable decoder */
       ensure_caps_profile (h265parse, caps, sps);
     }

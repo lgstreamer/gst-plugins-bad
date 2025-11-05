@@ -368,7 +368,7 @@ check_media_seqnums (GstM3U8 * self, GList * previous_files)
 
   if (!self->files || !self->targetduration) {
     self->reload_interval = 10 * GST_SECOND;
-    GST_WARNING ("Abnormal playlist from server!");
+    GST_SYS_WARNING ("Abnormal playlist from server!");
     return FALSE;
   }
 
@@ -487,8 +487,9 @@ generate_media_seqnums (GstM3U8 * self, GList * previous_files)
       mediasequence++;
 
       if (!g_str_equal (f1->uri, f2->uri)) {
-        GST_WARNING ("Inconsistent URIs after playlist update: '%s' != '%s'",
-            f1->uri, f2->uri);
+        GST_SYS_WARNING
+            ("Inconsistent URIs after playlist update: '%s' != '%s'", f1->uri,
+            f2->uri);
       }
     }
   } else {
@@ -525,6 +526,9 @@ gst_m3u8_update (GstM3U8 * self, gchar * data)
   GList *previous_files = NULL;
   gboolean have_mediasequence = FALSE;
   GstM3U8InitFile *last_init_file = NULL;
+  gboolean cue_out = FALSE;
+  gboolean cue_in = FALSE;
+  gdouble cue_out_duration = GST_CLOCK_TIME_NONE;
 
   g_return_val_if_fail (self != NULL, FALSE);
   g_return_val_if_fail (data != NULL, FALSE);
@@ -540,7 +544,7 @@ gst_m3u8_update (GstM3U8 * self, gchar * data)
   }
 
   if (!g_str_has_prefix (data, "#EXTM3U")) {
-    GST_WARNING ("Data doesn't start with #EXTM3U");
+    GST_SYS_WARNING ("Data doesn't start with #EXTM3U");
     g_free (data);
     GST_M3U8_UNLOCK (self);
     return FALSE;
@@ -625,11 +629,22 @@ gst_m3u8_update (GstM3U8 * self, gchar * data)
         if (last_init_file)
           file->init_file = gst_m3u8_init_file_ref (last_init_file);
 
+        file->cue_out = cue_out;
+        file->cue_in = cue_in;
+        if (cue_out) {
+          file->cue_out_duration = cue_out_duration;
+          GST_DEBUG ("CUE-OUT:DURATION: %" GST_TIME_FORMAT,
+              GST_TIME_ARGS (file->cue_out_duration));
+        }
+
         duration = 0;
         title = NULL;
         discontinuity = FALSE;
         size = offset = -1;
         self->files = g_list_prepend (self->files, file);
+        cue_out = FALSE;
+        cue_in = FALSE;
+        cue_out_duration = GST_CLOCK_TIME_NONE;
       }
 
     } else if (g_str_has_prefix (data, "#EXTINF:")) {
@@ -803,6 +818,32 @@ gst_m3u8_update (GstM3U8 * self, gchar * data)
 
           last_init_file = init_file;
         }
+      } else if (g_str_has_prefix (data_ext_x, "CUE-OUT:DURATION=")) {
+        /* Based on:
+         * https://docs.aws.amazon.com/ko_kr/mediatailor/latest/ug/hls-ad-markers.html */
+        gdouble fval;
+        if (double_from_string (data + 24, &data, &fval)) {
+          GST_DEBUG ("EXT-X-CUE-OUT:%lf type 1 with DURATION=", fval);
+          cue_out = TRUE;
+          cue_out_duration = fval * (gdouble) GST_SECOND;
+        }
+      } else if (g_str_has_prefix (data_ext_x, "CUE-OUT:")) {
+        gdouble fval;
+        if (double_from_string (data + 15, &data, &fval)) {
+          GST_DEBUG ("EXT-X-CUE-OUT:%lf type 2", fval);
+          cue_out_duration = fval * (gdouble) GST_SECOND;
+          cue_out = TRUE;
+        }
+      } else if (g_str_has_prefix (data_ext_x, "CUE-OUT-CONT")) {
+        /* FIXME:
+         * parse n/duration : delimeter / */
+        GST_DEBUG ("Ignore EXT-X-CUE-OUT-CONT");
+      } else if (g_str_has_prefix (data_ext_x, "CUE-OUT")) {
+        GST_DEBUG ("EXT-X-CUE-OUT type 3");
+        cue_out = TRUE;
+      } else if (g_str_has_prefix (data_ext_x, "CUE-IN")) {
+        GST_DEBUG ("EXT-X-CUE-IN");
+        cue_in = TRUE;
       } else {
         GST_LOG ("Ignored line: %s", data);
       }
@@ -1082,8 +1123,12 @@ gst_m3u8_get_next_fragment (GstM3U8 * m3u8, gboolean forward,
 
   if (sequence_position)
     *sequence_position = m3u8->sequence_position;
-  if (discont)
+  if (discont) {
     *discont = file->discont || (m3u8->sequence != file->sequence);
+    if (*discont) {
+      GST_DEBUG ("discontinuity found!");
+    }
+  }
 
   m3u8->current_file_duration = file->duration;
   m3u8->sequence = file->sequence;
@@ -1147,6 +1192,7 @@ m3u8_alternate_advance (GstM3U8 * m3u8, gboolean forward)
   m3u8->current_file = tmp;
   m3u8->sequence = targetnum;
   m3u8->current_file_duration = GST_M3U8_MEDIA_FILE (tmp->data)->duration;
+  GST_M3U8_MEDIA_FILE (tmp->data)->discont = TRUE;
 }
 
 gboolean
@@ -1190,7 +1236,7 @@ gst_m3u8_advance_fragment (GstM3U8 * m3u8, gboolean forward)
 
       /* Resync sequence number if the above has failed for live streams */
       if (m3u8->current_file == NULL && GST_M3U8_IS_LIVE (m3u8)) {
-        GST_WARNING ("Resyncing live playlist");
+        GST_SYS_WARNING ("Resyncing live playlist");
         ret = FALSE;
       }
       goto out;
@@ -1278,6 +1324,12 @@ gst_m3u8_get_reload_interval (GstM3U8 * m3u8)
   g_return_val_if_fail (m3u8 != NULL, GST_CLOCK_TIME_NONE);
 
   GST_M3U8_LOCK (m3u8);
+  if (!m3u8->files) {
+    GST_SYS_WARNING ("Corrupt m3u8 playlist, file list does not exist.");
+    GST_M3U8_UNLOCK (m3u8);
+    return m3u8->targetduration > 0 ? m3u8->targetduration : (3 * GST_SECOND);
+  }
+
   if (m3u8->reload_interval <= 0) {
     /* First interval */
     reload_interval = m3u8->version > 5 ? m3u8->targetduration :
@@ -1479,7 +1531,7 @@ gst_m3u8_unquote (const gchar * str)
     return g_strdup (str);
   end = strchr (start + 1, '"');
   if (end == NULL) {
-    GST_WARNING ("Broken quoted string [%s] - can't find end quote", str);
+    GST_SYS_WARNING ("Broken quoted string [%s] - can't find end quote", str);
     return g_strdup (start + 1);
   }
   return g_strndup (start + 1, (gsize) (end - (start + 1)));
@@ -1559,7 +1611,7 @@ uri_with_cc:
   }
 required_attributes_missing:
   {
-    GST_WARNING ("EXT-X-MEDIA description is missing required attributes");
+    GST_SYS_WARNING ("EXT-X-MEDIA description is missing required attributes");
     goto out_error;
     /* fall through */
   }
@@ -1752,7 +1804,7 @@ gst_hls_master_playlist_new_from_data (gchar * data, const gchar * base_uri)
   gboolean need_to_set_default_media = FALSE;
 
   if (!g_str_has_prefix (data, "#EXTM3U")) {
-    GST_WARNING ("Data doesn't start with #EXTM3U");
+    GST_SYS_WARNING ("Data doesn't start with #EXTM3U");
     g_free (free_data);
     return NULL;
   }
@@ -1907,13 +1959,13 @@ gst_hls_master_playlist_new_from_data (gchar * data, const gchar * base_uri)
         if (g_str_equal (a, "BANDWIDTH")) {
           if (!stream->bandwidth) {
             if (!int_from_string (v, NULL, &stream->bandwidth))
-              GST_WARNING ("Error while reading BANDWIDTH");
+              GST_SYS_WARNING ("Error while reading BANDWIDTH");
           }
         } else if (g_str_equal (a, "AVERAGE-BANDWIDTH")) {
           GST_DEBUG
               ("AVERAGE-BANDWIDTH attribute available. Using it as stream bandwidth");
           if (!int_from_string (v, NULL, &stream->bandwidth))
-            GST_WARNING ("Error while reading AVERAGE-BANDWIDTH");
+            GST_SYS_WARNING ("Error while reading AVERAGE-BANDWIDTH");
         } else if (g_str_equal (a, "PROGRAM-ID")) {
           if (!int_from_string (v, NULL, &stream->program_id))
             GST_WARNING ("Error while reading PROGRAM-ID");
@@ -1925,13 +1977,13 @@ gst_hls_master_playlist_new_from_data (gchar * data, const gchar * base_uri)
           /* this variant stream include video */
           stream->stream_type |= GST_STREAM_TYPE_VIDEO;
           if (!int_from_string (v, &v, &stream->width))
-            GST_WARNING ("Error while reading RESOLUTION width");
+            GST_SYS_WARNING ("Error while reading RESOLUTION width");
           if (!v || *v != 'x') {
-            GST_WARNING ("Missing height");
+            GST_SYS_WARNING ("Missing height");
           } else {
             v = g_utf8_next_char (v);
             if (!int_from_string (v, NULL, &stream->height))
-              GST_WARNING ("Error while reading RESOLUTION height");
+              GST_SYS_WARNING ("Error while reading RESOLUTION height");
           }
         } else if (stream->iframe && g_str_equal (a, "URI")) {
           stream->uri = uri_join (base_uri, v);
@@ -1973,7 +2025,7 @@ gst_hls_master_playlist_new_from_data (gchar * data, const gchar * base_uri)
         }
       } else {
         if (pending_stream != NULL) {
-          GST_WARNING ("variant stream without uri, dropping");
+          GST_SYS_WARNING ("variant stream without uri, dropping");
           gst_hls_variant_stream_unref (pending_stream);
         }
         pending_stream = stream;
@@ -2170,7 +2222,7 @@ gst_hls_master_playlist_new_from_data (gchar * data, const gchar * base_uri)
   }
 
   if (playlist->variants == NULL) {
-    GST_WARNING ("Master playlist without any media playlists!");
+    GST_SYS_WARNING ("Master playlist without any media playlists!");
     gst_hls_master_playlist_unref (playlist);
     return NULL;
   }
@@ -2331,4 +2383,148 @@ gst_hls_master_playlist_get_initial_bitrate (GstHLSMasterPlaylist *
   }
 
   return bitrate_by_start > bitrate_by_min ? bitrate_by_start : bitrate_by_min;
+}
+
+#define CUE_INIT 0x00
+#define CUE_OUT 0x01
+#define CUE_IN 0x02
+#define CUE_PAIR_FOUND 0x03
+
+gboolean
+gst_m3u8_get_ad_markers (GstM3U8 * m3u8, const gchar * msg_name,
+    GstStructure ** structure)
+{
+  GstClockTime sequence_pos = 0;
+  GList *file;
+  guint found = CUE_INIT;
+  guint length = 0;
+  GstClockTime cue_out_timestamp = GST_CLOCK_TIME_NONE;
+  GstClockTime cue_duration = GST_CLOCK_TIME_NONE;
+  GstClockTime cue_in_timestamp = GST_CLOCK_TIME_NONE;
+  GValue ads = G_VALUE_INIT;
+
+  g_value_init (&ads, GST_TYPE_ARRAY);
+
+  GST_DEBUG ("Looking for CUE-OUT, CUE-IN in %s", m3u8->uri);
+
+  file = g_list_first (m3u8->files);
+  while (file) {
+
+    GstM3U8MediaFile *mfile = GST_M3U8_MEDIA_FILE (file->data);
+
+    if (mfile->cue_out && mfile->cue_in) {
+      GST_WARNING ("segment %" G_GINT64_FORMAT
+          ", %s invalid consecutive markers!", mfile->sequence, mfile->uri);
+      sequence_pos += mfile->duration;
+      file = file->next;
+      continue;
+    }
+
+    if (mfile->cue_out) {
+      GST_DEBUG ("cue-out: %" GST_TIME_FORMAT " cue-duration: %"
+          GST_TIME_FORMAT, GST_TIME_ARGS (sequence_pos),
+          GST_TIME_ARGS (mfile->cue_out_duration));
+      found = CUE_OUT;
+      cue_out_timestamp = sequence_pos;
+      cue_duration = mfile->cue_out_duration;
+      g_value_reset (&ads);
+    }
+    /* Mark the number of ads in one cue-out - cue-in session. */
+    if (found == CUE_OUT) {
+      if (mfile->discont && !mfile->cue_in) {
+        GValue start = G_VALUE_INIT;
+
+        g_value_init (&start, G_TYPE_UINT64);
+        GST_DEBUG ("Found ad, start timestamp: %" G_GUINT64_FORMAT,
+            sequence_pos);
+        /* Push ad start timestamp to ads array. */
+        g_value_set_uint64 (&start, sequence_pos);
+        gst_value_array_append_value (&ads, &start);
+
+        g_value_unset (&start);
+      }
+    }
+    if (mfile->cue_in) {
+      GST_DEBUG ("cue-in: %" GST_TIME_FORMAT, GST_TIME_ARGS (sequence_pos));
+
+      if (found == CUE_OUT) {
+        found |= CUE_IN;
+        cue_in_timestamp = sequence_pos;
+
+        if (cue_in_timestamp - cue_out_timestamp != cue_duration) {
+          GST_WARNING
+              ("cue duration attribute value does not match actual stream segments' accumulated duration!");
+          GST_DEBUG ("update cue_duration from: %" G_GUINT64_FORMAT " -> %"
+              G_GUINT64_FORMAT, cue_duration,
+              (cue_in_timestamp - cue_out_timestamp));
+          cue_duration = cue_in_timestamp - cue_out_timestamp;
+        }
+      } else {
+        GST_WARNING ("cue-out did not appear before cue-in");
+      }
+    }
+    if (found == CUE_PAIR_FOUND && GST_CLOCK_TIME_IS_VALID (cue_out_timestamp)
+        && GST_CLOCK_TIME_IS_VALID (cue_in_timestamp)) {
+      gchar name[128];
+      GstStructure *cue_structure = NULL;
+      guint ad_length = 0;
+      uint i = 0;
+
+      ad_length = gst_value_array_get_size (&ads);
+
+      GST_DEBUG ("Number of ads in this cue-out session: %u", ad_length);
+
+      for (i = 0; i < ad_length; i++) {
+        const GValue *start_v;
+        guint64 start_ts = 0;
+        start_v = gst_value_array_get_value (&ads, i);
+        start_ts = g_value_get_uint64 (start_v);
+        GST_DEBUG ("Ad %u of %u, start timestamp: %" G_GUINT64_FORMAT, i + 1,
+            ad_length, start_ts);
+      }
+
+      GST_DEBUG ("adding cue-out: %" G_GUINT64_FORMAT
+          " cue-duration: %" G_GUINT64_FORMAT " cue-in: %"
+          G_GUINT64_FORMAT, cue_out_timestamp, cue_duration, cue_in_timestamp);
+
+      g_snprintf (name, 128, "cue-indicator-%u", length);
+      cue_structure =
+          gst_structure_new (name,
+          "cue-out", G_TYPE_UINT64, cue_out_timestamp,
+          "cue-duration", G_TYPE_UINT64, cue_duration,
+          "cue-in", G_TYPE_UINT64, cue_in_timestamp, NULL);
+
+      gst_structure_set_value (cue_structure, "ads", &ads);
+
+      if (cue_structure) {
+        if (!*structure) {
+          *structure = gst_structure_new_empty (msg_name);
+        }
+        gst_structure_set (*structure, name, GST_TYPE_STRUCTURE, cue_structure,
+            NULL);
+      }
+
+      length++;
+      cue_out_timestamp = GST_CLOCK_TIME_NONE;
+      cue_duration = GST_CLOCK_TIME_NONE;
+      cue_in_timestamp = GST_CLOCK_TIME_NONE;
+      gst_structure_free (cue_structure);
+      found = CUE_INIT;
+      g_value_reset (&ads);
+    }
+    sequence_pos += mfile->duration;
+    file = file->next;
+  }
+
+  g_value_unset (&ads);
+
+  if (!length) {
+    if (*structure) {
+      gst_structure_free (*structure);
+      *structure = NULL;
+    }
+    return FALSE;
+  }
+  GST_DEBUG ("length: %u, %" GST_PTR_FORMAT, length, *structure);
+  return TRUE;
 }

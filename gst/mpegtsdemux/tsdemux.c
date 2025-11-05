@@ -2298,7 +2298,7 @@ gst_ts_demux_set_caps_for_private_dovi_video (GstTSDemux * tsdemux,
           "dolby-vision-profile", G_TYPE_INT, dv_profile, NULL);
       break;
     default:
-      GST_DEBUG ("Invalid range of dv_prifile!!!");
+      GST_DEBUG ("Invalid range of dv_profile!!!");
       return;
   }
   dv_level = DESC_DOVI_VIDEO_STREAM_dv_level (desc);
@@ -3346,12 +3346,13 @@ create_pad_for_stream (MpegTSBase * base, MpegTSBaseStream * bstream,
        * OR program is ATSC (GA94)
        * OR stream registration is AC-3
        * then it's regular AC3 */
+      desc = mpegts_get_descriptor_from_stream (bstream, GST_MTS_DESC_DVB_AC3);
       if (bstream->registration_id == DRF_ID_AC3 ||
           program->registration_id == DRF_ID_GA94 ||
-          mpegts_get_descriptor_from_stream (bstream, GST_MTS_DESC_DVB_AC3)) {
+          desc) {
         is_audio = TRUE;
         caps = gst_caps_new_empty_simple ("audio/x-ac3");
-        if (mpegts_get_descriptor_from_stream (bstream, GST_MTS_DESC_DVB_AC3))
+        if (desc)
           gst_ts_demux_set_caps_for_private_dvb_ac3_eac3_descriptor (stream,
               desc->data);
         tag_name = GST_TAG_AUDIO_CODEC;
@@ -6254,6 +6255,7 @@ gst_ts_demux_parse_video_es (GstTSDemux * demux, TSDemuxStream * stream)
             switch (dv_profile) {
               case 0:
               case 1:
+              case 9:
                 gst_ts_demux_parse_h264_video (demux, stream);
                 break;
               case 2:
@@ -6262,6 +6264,7 @@ gst_ts_demux_parse_video_es (GstTSDemux * demux, TSDemuxStream * stream)
               case 5:
               case 6:
               case 7:
+              case 8:
                 gst_ts_demux_parse_h265_video (demux, stream);
                 break;
               default:
